@@ -22,7 +22,7 @@ from components import question_card
 from components import results as results_component
 from components import session_report as session_report_component
 from components import timer as timer_component
-from services import analytics, database as db, quiz_engine, session_manager
+from services import analytics, database as db, diagnostics, quiz_engine, session_manager
 from utils import auth, qr_code
 from utils.excel_export import build_session_results_workbook
 
@@ -167,76 +167,94 @@ def _render_create_session_form() -> None:
 # ---------------------------------------------------------------
 @st.fragment(run_every=POLL_SECONDS)
 def _render_control_room(session_id: str) -> None:
-    # Session questions are fixed for a session's whole lifetime (never
-    # added to or removed from once it starts), so the count is cached
-    # per-tab after the first tick instead of being re-queried via
-    # list_session_questions on every single 2-second poll.
-    total_q_key = f"nbk_total_q_{session_id}"
-    state = session_manager.get_full_state(session_id, st.session_state.get(total_q_key))
-    if not state:
-        st.warning("Session not found.")
-        return
-    st.session_state.setdefault(total_q_key, state["total_questions"])
-    session = state["session"]
-    cq = state["current_question"]
-
-    if session["reveal_mode"] == "DEFERRED" and session["status"] in ("QUESTION_ACTIVE", "VOTING_CLOSED"):
-        # All-at-once mode is fully hands-off: voting closes and the
-        # session advances to the next question automatically (timer
-        # expiry or everyone-answered) all the way up to the last
-        # question's results -- no host click needed until the final
-        # "Reveal to Participants". Pass this tick's already-fetched
-        # state in so auto_advance_deferred doesn't re-query it, and
-        # only re-fetch full state if a transition actually happened.
-        transitioned = session_manager.auto_advance_deferred(
-            session_id,
-            session=state["session"],
-            sq=state["current_question"],
-            participant_count=state["participant_count"],
-            response_count=state["response_count"],
-        )
-        if transitioned is not None:
-            state = session_manager.get_full_state(session_id, st.session_state.get(total_q_key))
+    # TEMPORARY diagnostics (see services/diagnostics.py) -- start_poll/
+    # end_poll bracket the whole fragment execution; the try/finally
+    # guarantees end_poll (and its summary line) always fires, even on
+    # an early return or an unhandled exception.
+    diagnostics.start_poll("HOST_POLL")
+    diagnostics.mark("fragment_start")
+    try:
+        # Session questions are fixed for a session's whole lifetime (never
+        # added to or removed from once it starts), so the count is cached
+        # per-tab after the first tick instead of being re-queried via
+        # list_session_questions on every single 2-second poll.
+        total_q_key = f"nbk_total_q_{session_id}"
+        cached_total = st.session_state.get(total_q_key)
+        diagnostics.mark(f"before_get_full_state(cache_hit={cached_total is not None})")
+        state = session_manager.get_full_state(session_id, cached_total)
+        diagnostics.mark("get_full_state_done")
+        if not state:
+            st.warning("Session not found.")
+            return
+        st.session_state.setdefault(total_q_key, state["total_questions"])
         session = state["session"]
         cq = state["current_question"]
-    elif session["status"] == "QUESTION_ACTIVE":
-        # Pass in what this tick already fetched instead of
-        # re-querying it inside force_close_voting_if_timer_expired,
-        # and use its return value directly instead of unconditionally
-        # re-reading the session "just in case" afterwards -- when
-        # nothing closed, the already-fetched `session` is still correct.
-        updated = session_manager.force_close_voting_if_timer_expired(
-            session_id, session=state["session"], sq=state["current_question"]
+
+        if session["reveal_mode"] == "DEFERRED" and session["status"] in ("QUESTION_ACTIVE", "VOTING_CLOSED"):
+            # All-at-once mode is fully hands-off: voting closes and the
+            # session advances to the next question automatically (timer
+            # expiry or everyone-answered) all the way up to the last
+            # question's results -- no host click needed until the final
+            # "Reveal to Participants". Pass this tick's already-fetched
+            # state in so auto_advance_deferred doesn't re-query it, and
+            # only re-fetch full state if a transition actually happened.
+            transitioned = session_manager.auto_advance_deferred(
+                session_id,
+                session=state["session"],
+                sq=state["current_question"],
+                participant_count=state["participant_count"],
+                response_count=state["response_count"],
+            )
+            diagnostics.mark(f"auto_advance_deferred_done(transitioned={transitioned is not None})")
+            if transitioned is not None:
+                state = session_manager.get_full_state(session_id, st.session_state.get(total_q_key))
+                diagnostics.mark("get_full_state_refetch_done")
+            session = state["session"]
+            cq = state["current_question"]
+        elif session["status"] == "QUESTION_ACTIVE":
+            # Pass in what this tick already fetched instead of
+            # re-querying it inside force_close_voting_if_timer_expired,
+            # and use its return value directly instead of unconditionally
+            # re-reading the session "just in case" afterwards -- when
+            # nothing closed, the already-fetched `session` is still correct.
+            updated = session_manager.force_close_voting_if_timer_expired(
+                session_id, session=state["session"], sq=state["current_question"]
+            )
+            diagnostics.mark(f"force_close_voting_if_timer_expired_done(closed={updated is not None})")
+            if updated is not None:
+                session = updated
+
+        _render_header(session, state)
+        diagnostics.mark("header_and_qr_render_done")
+
+        status = session["status"]
+        if status == "WAITING":
+            _render_waiting(session)
+        elif status == "QUESTION_ACTIVE":
+            _render_question_active(session, cq)
+        elif status == "VOTING_CLOSED":
+            _render_voting_closed(session, cq)
+        elif status == "RESULTS_REVEALED":
+            _render_results_revealed(session, cq)
+        elif status == "LEADERBOARD":
+            _render_leaderboard(session, state["total_questions"])
+        elif status == "SESSION_ENDED":
+            _render_session_ended(session)
+        diagnostics.mark("status_screen_render_done")
+
+        # The terminal group-summary screen (shown by _render_leaderboard
+        # once there's no next question, and always by _render_session_ended)
+        # already has its own Download/End Session controls -- skip the
+        # generic footer there to avoid duplicate buttons.
+        is_final_screen = status == "SESSION_ENDED" or (
+            status == "LEADERBOARD"
+            and not quiz_engine.has_next_question(session["id"], session["current_question_index"], state["total_questions"])
         )
-        if updated is not None:
-            session = updated
-
-    _render_header(session, state)
-
-    status = session["status"]
-    if status == "WAITING":
-        _render_waiting(session)
-    elif status == "QUESTION_ACTIVE":
-        _render_question_active(session, cq)
-    elif status == "VOTING_CLOSED":
-        _render_voting_closed(session, cq)
-    elif status == "RESULTS_REVEALED":
-        _render_results_revealed(session, cq)
-    elif status == "LEADERBOARD":
-        _render_leaderboard(session, state["total_questions"])
-    elif status == "SESSION_ENDED":
-        _render_session_ended(session)
-
-    # The terminal group-summary screen (shown by _render_leaderboard
-    # once there's no next question, and always by _render_session_ended)
-    # already has its own Download/End Session controls -- skip the
-    # generic footer there to avoid duplicate buttons.
-    is_final_screen = status == "SESSION_ENDED" or (
-        status == "LEADERBOARD"
-        and not quiz_engine.has_next_question(session["id"], session["current_question_index"], state["total_questions"])
-    )
-    if not is_final_screen:
-        _render_footer_controls(session)
+        if not is_final_screen:
+            _render_footer_controls(session)
+        diagnostics.mark("main_render_done")
+    finally:
+        diagnostics.end_poll(pool_stats=db.get_pool_stats(), label="HOST_POLL")
 
 
 def _chart_type_toggle(key: str) -> str:
@@ -276,8 +294,10 @@ def _render_header(session: dict, state: dict) -> None:
                 "app reachable over the internet."
             )
         with jc2:
+            diagnostics.mark("before_qr_render")
             png = qr_code.generate_qr_code_png(join_url)
             st.image(png, width=180)
+            diagnostics.mark("after_qr_render")
 
 
 def _render_waiting(session: dict) -> None:

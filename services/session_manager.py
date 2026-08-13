@@ -37,6 +37,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from services import database as db
+from services import diagnostics
 from services import quiz_engine
 from services import scoring
 
@@ -99,7 +100,9 @@ def get_full_state(session_id: str, known_total_questions: int | None = None) ->
         return {}
     current_q = None
     if session.get("current_session_question_id"):
+        diagnostics.mark("before_get_current_question")
         current_q = db.get_session_question(session["current_session_question_id"])
+        diagnostics.mark("after_get_current_question")
     return {
         "session": session,
         "current_question": current_q,

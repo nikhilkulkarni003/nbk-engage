@@ -24,7 +24,7 @@ from components.leaderboard import render_leaderboard as render_lb
 from components.results import render_rating_summary, render_results_bars
 from components.review import render_full_review
 from components.session_report import render_session_report
-from services import analytics, database as db, quiz_engine, session_manager
+from services import analytics, database as db, diagnostics, quiz_engine, session_manager
 
 POLL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
 
@@ -135,54 +135,73 @@ def _render_leave_button() -> None:
 
 @st.fragment(run_every=POLL_SECONDS)
 def _render_session_screen(session_static: dict, participant_static: dict) -> None:
-    session_id = session_static["id"]
-    participant_id = participant_static["id"]
+    # TEMPORARY diagnostics (see services/diagnostics.py) -- start_poll/
+    # end_poll bracket the whole fragment execution; the try/finally
+    # guarantees end_poll (and its summary line) always fires, even on
+    # an early return or an unhandled exception.
+    diagnostics.start_poll("PARTICIPANT_POLL")
+    diagnostics.mark("fragment_start")
+    try:
+        session_id = session_static["id"]
+        participant_id = participant_static["id"]
 
-    session = db.get_session(session_id)
-    if not session:
-        st.warning("This session no longer exists.")
-        return
-    participant = db.get_participant(participant_id)
-    if not participant:
-        st.warning("Your participant record was not found.")
-        return
-
-    touch_key = f"nbk_last_touch_{participant_id}"
-    now = time.monotonic()
-    if now - st.session_state.get(touch_key, 0.0) >= TOUCH_MIN_INTERVAL_SECONDS:
-        db.touch_participant(participant_id)
-        st.session_state[touch_key] = now
-
-    st.markdown(f"**{session['title']}**  ·  👤 {participant['name']}")
-    status = session["status"]
-    # Session questions are fixed for the session's whole lifetime, so
-    # the count is cached per-tab after the first tick instead of
-    # being re-queried via list_session_questions on every poll tick.
-    total_q_key = f"nbk_total_q_{session_id}"
-    total_questions = quiz_engine.total_questions(session_id, st.session_state.get(total_q_key))
-    st.session_state.setdefault(total_q_key, total_questions)
-    progress_component.render_progress(session["current_question_index"], total_questions, status)
-
-    if status == "WAITING":
-        _render_waiting(session)
-    elif status == "SESSION_ENDED":
-        _render_session_ended(session, participant)
-    else:
-        sq = db.get_session_question(session["current_session_question_id"]) if session.get(
-            "current_session_question_id") else None
-        if not sq:
-            _render_waiting(session)
+        session = db.get_session(session_id)
+        diagnostics.mark("get_session_done")
+        if not session:
+            st.warning("This session no longer exists.")
             return
-        if status == "QUESTION_ACTIVE":
-            _render_question_active(session, sq, participant)
-        elif status == "VOTING_CLOSED":
-            _render_voting_closed(sq, participant)
-        elif status == "RESULTS_REVEALED":
-            _render_results(sq, participant)
-        elif status == "LEADERBOARD":
-            _render_leaderboard(session, participant)
+        participant = db.get_participant(participant_id)
+        diagnostics.mark("get_participant_done")
+        if not participant:
+            st.warning("Your participant record was not found.")
+            return
 
-    st.markdown("---")
+        touch_key = f"nbk_last_touch_{participant_id}"
+        now = time.monotonic()
+        if now - st.session_state.get(touch_key, 0.0) >= TOUCH_MIN_INTERVAL_SECONDS:
+            db.touch_participant(participant_id)
+            st.session_state[touch_key] = now
+            diagnostics.mark("touch_participant_done(executed=True)")
+        else:
+            diagnostics.mark("touch_participant_done(executed=False, throttled)")
+
+        st.markdown(f"**{session['title']}**  ·  👤 {participant['name']}")
+        status = session["status"]
+        # Session questions are fixed for the session's whole lifetime, so
+        # the count is cached per-tab after the first tick instead of
+        # being re-queried via list_session_questions on every poll tick.
+        total_q_key = f"nbk_total_q_{session_id}"
+        cached_total = st.session_state.get(total_q_key)
+        total_questions = quiz_engine.total_questions(session_id, cached_total)
+        st.session_state.setdefault(total_q_key, total_questions)
+        diagnostics.mark(f"total_questions_done(cache_hit={cached_total is not None})")
+        progress_component.render_progress(session["current_question_index"], total_questions, status)
+
+        if status == "WAITING":
+            _render_waiting(session)
+        elif status == "SESSION_ENDED":
+            _render_session_ended(session, participant)
+        else:
+            diagnostics.mark("before_get_session_question")
+            sq = db.get_session_question(session["current_session_question_id"]) if session.get(
+                "current_session_question_id") else None
+            diagnostics.mark("after_get_session_question")
+            if not sq:
+                _render_waiting(session)
+                return
+            if status == "QUESTION_ACTIVE":
+                _render_question_active(session, sq, participant)
+            elif status == "VOTING_CLOSED":
+                _render_voting_closed(sq, participant)
+            elif status == "RESULTS_REVEALED":
+                _render_results(sq, participant)
+            elif status == "LEADERBOARD":
+                _render_leaderboard(session, participant)
+
+        st.markdown("---")
+        diagnostics.mark("main_render_done")
+    finally:
+        diagnostics.end_poll(pool_stats=db.get_pool_stats(), label="PARTICIPANT_POLL")
     _render_leave_button()
 
 
@@ -194,9 +213,12 @@ def _render_waiting(session: dict) -> None:
 
 def _render_question_active(session: dict, sq: dict, participant: dict) -> None:
     existing = db.get_response(sq["id"], participant["id"])
+    diagnostics.mark("get_response_done")
 
     question_card.render_question_prompt(sq)
+    diagnostics.mark("question_rendering_done")
     remaining = timer_component.render_timer(sq.get("started_at"), sq.get("timer_seconds"))
+    diagnostics.mark("timer_rendering_done")
 
     if existing:
         st.success("✅ Answer submitted! Waiting for the host...")

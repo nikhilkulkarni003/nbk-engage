@@ -13,14 +13,25 @@ from __future__ import annotations
 
 import os
 import random
+import sys
+import time
 import uuid
 from contextlib import contextmanager
 from typing import Any, Optional
 
 import streamlit as st
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
+
+from services import diagnostics
+
+# TEMPORARY diagnostics: counts physical DBAPI connections the pool has
+# ever created (via the SQLAlchemy "connect" event, wired up on the
+# engine in get_engine() below), so a query can tell whether its
+# connection checkout reused an idle pooled connection or forced the
+# pool to open a brand-new one. See services/diagnostics.py.
+_new_connection_count = 0
 
 
 # ---------------------------------------------------------------
@@ -57,13 +68,49 @@ def get_engine() -> Engine:
             "DATABASE_URL is not set. Copy .env.example to .env and fill in "
             "your Supabase Postgres connection string."
         )
-    return create_engine(
+    engine = create_engine(
         database_url,
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=5,
         pool_recycle=300,
     )
+
+    # TEMPORARY diagnostics: fires only when the pool actually opens a
+    # new physical connection (not when it hands out an already-open,
+    # idle pooled one). Never touches connection parameters/secrets.
+    @event.listens_for(engine, "connect")
+    def _nbk_diag_on_new_connection(dbapi_connection, connection_record):  # noqa: ANN001
+        global _new_connection_count
+        _new_connection_count += 1
+
+    return engine
+
+
+def get_pool_stats() -> dict:
+    """TEMPORARY diagnostics: read-only snapshot of the SQLAlchemy
+    pool's current occupancy. Safe to call anytime."""
+    try:
+        pool = get_engine().pool
+        return {
+            "size": pool.size(),
+            "checked_in": pool.checkedin(),
+            "checked_out": pool.checkedout(),
+            "overflow": pool.overflow(),
+        }
+    except Exception:  # noqa: BLE001 - diagnostics must never break the app
+        return {}
+
+
+def _caller_op_name() -> str:
+    """TEMPORARY diagnostics: the name of the database.py function that
+    called fetch_one/fetch_all/execute (e.g. "get_session"), used to
+    label each query in the diagnostic log without threading a name
+    through every one of this module's ~40 call sites."""
+    try:
+        return sys._getframe(2).f_code.co_name  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        return "unknown"
 
 
 def check_connection() -> tuple[bool, str]:
@@ -89,21 +136,48 @@ def get_conn():
 
 
 def fetch_all(query: str, params: Optional[dict] = None) -> list[dict]:
+    op = _caller_op_name()
+    global _new_connection_count
+    conns_before = _new_connection_count
+    t0 = time.perf_counter()
     with get_conn() as conn:
+        t1 = time.perf_counter()  # (A) time spent acquiring a pool connection + BEGIN
         rows = conn.execute(text(query), params or {}).mappings().all()
-        return [dict(r) for r in rows]
+        t2 = time.perf_counter()  # (B) time spent executing the SQL itself
+        result = [dict(r) for r in rows]
+    diagnostics.record_query(op, (t1 - t0) * 1000, (t2 - t1) * 1000,
+                              _new_connection_count > conns_before)
+    return result
 
 
 def fetch_one(query: str, params: Optional[dict] = None) -> Optional[dict]:
+    op = _caller_op_name()
+    global _new_connection_count
+    conns_before = _new_connection_count
+    t0 = time.perf_counter()
     with get_conn() as conn:
+        t1 = time.perf_counter()
         row = conn.execute(text(query), params or {}).mappings().first()
-        return dict(row) if row else None
+        t2 = time.perf_counter()
+        result = dict(row) if row else None
+    diagnostics.record_query(op, (t1 - t0) * 1000, (t2 - t1) * 1000,
+                              _new_connection_count > conns_before)
+    return result
 
 
 def execute(query: str, params: Optional[dict] = None) -> int:
+    op = _caller_op_name()
+    global _new_connection_count
+    conns_before = _new_connection_count
+    t0 = time.perf_counter()
     with get_conn() as conn:
+        t1 = time.perf_counter()
         result = conn.execute(text(query), params or {})
-        return result.rowcount
+        t2 = time.perf_counter()
+        rowcount = result.rowcount
+    diagnostics.record_query(op, (t1 - t0) * 1000, (t2 - t1) * 1000,
+                              _new_connection_count > conns_before)
+    return rowcount
 
 
 # =================================================================
