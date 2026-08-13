@@ -86,8 +86,14 @@ def create_session(title: str, question_set_id: str, host_name: str,
     return session
 
 
-def get_full_state(session_id: str) -> dict:
-    """Everything a host/participant screen needs for one poll cycle."""
+def get_full_state(session_id: str, known_total_questions: int | None = None) -> dict:
+    """Everything a host/participant screen needs for one poll cycle.
+
+    known_total_questions lets a caller that has already cached the
+    session's question count (it's fixed for the session's whole
+    lifetime -- see quiz_engine.total_questions) skip the
+    list_session_questions round trip entirely, on every tick, not
+    just within one. Falls back to fetching it when not supplied."""
     session = db.get_session(session_id)
     if not session:
         return {}
@@ -99,7 +105,7 @@ def get_full_state(session_id: str) -> dict:
         "current_question": current_q,
         "participant_count": db.count_participants(session_id),
         "response_count": db.count_responses(current_q["id"]) if current_q else 0,
-        "total_questions": quiz_engine.total_questions(session_id),
+        "total_questions": quiz_engine.total_questions(session_id, known_total_questions),
     }
 
 
@@ -215,14 +221,24 @@ def submit_answer(session_id: str, session_question_id: str, participant_id: str
     )
 
 
-def force_close_voting_if_timer_expired(session_id: str) -> dict | None:
+def force_close_voting_if_timer_expired(session_id: str, session: dict | None = None,
+                                         sq: dict | None = None) -> dict | None:
     """Called by the host poll loop: if a timer was configured and has
     elapsed, auto-close voting server-side so latecomers cannot answer
-    after time is up, even if the host's own click lags."""
-    session = db.get_session(session_id)
+    after time is up, even if the host's own click lags.
+
+    session/sq let a caller that already fetched this tick's state
+    (via get_full_state) pass it straight in instead of this function
+    re-querying the same two rows again. The caller can then also use
+    this function's return value directly (the updated session when a
+    close happened, otherwise None) instead of unconditionally
+    re-reading the session afterwards "just in case" -- when nothing
+    changed, the caller's own already-fetched session is still correct.
+    """
+    session = session if session is not None else db.get_session(session_id)
     if session["status"] != "QUESTION_ACTIVE":
         return None
-    sq = db.get_session_question(session["current_session_question_id"])
+    sq = sq if sq is not None else db.get_session_question(session["current_session_question_id"])
     if not sq or not sq.get("timer_seconds") or not sq.get("started_at"):
         return None
     started_at = sq["started_at"]
@@ -234,7 +250,10 @@ def force_close_voting_if_timer_expired(session_id: str) -> dict | None:
     return None
 
 
-def auto_advance_deferred(session_id: str) -> dict | None:
+def auto_advance_deferred(session_id: str, session: dict | None = None,
+                           sq: dict | None = None,
+                           participant_count: int | None = None,
+                           response_count: int | None = None) -> dict | None:
     """DEFERRED reveal_mode only: fully hands-off question flow. Voting
     closes automatically once the timer expires OR every joined
     participant has answered (whichever comes first), and the session
@@ -247,18 +266,29 @@ def auto_advance_deferred(session_id: str) -> dict | None:
     group_summary_revealed_at -- that stays a deliberate host action
     ("Reveal to Participants"), identical to per-question mode's
     manual final reveal.
+
+    session/sq/participant_count/response_count let a caller that has
+    already fetched this same tick's state (e.g. host.py, right after
+    calling get_full_state) pass it straight in instead of this
+    function re-querying the same rows a second time. Each value is
+    still fetched here if not supplied, so calling with just
+    session_id (as before) behaves identically. Note this only affects
+    the read-side decision of *whether* to transition -- the actual
+    state-changing calls below (close_voting/next_question/etc.) each
+    re-read fresh from the DB immediately before writing, so this
+    never causes a stale write.
     """
-    session = db.get_session(session_id)
+    session = session if session is not None else db.get_session(session_id)
     if not session or session["reveal_mode"] != "DEFERRED":
         return None
 
     if session["status"] == "QUESTION_ACTIVE":
-        sq = db.get_session_question(session["current_session_question_id"])
+        sq = sq if sq is not None else db.get_session_question(session["current_session_question_id"])
         if not sq or not sq.get("started_at"):
             return None
 
-        participant_count = db.count_participants(session_id)
-        response_count = db.count_responses(sq["id"])
+        participant_count = participant_count if participant_count is not None else db.count_participants(session_id)
+        response_count = response_count if response_count is not None else db.count_responses(sq["id"])
         everyone_answered = participant_count > 0 and response_count >= participant_count
 
         timer_expired = False

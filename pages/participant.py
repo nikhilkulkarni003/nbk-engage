@@ -14,6 +14,7 @@ re-validate everything against the DB below).
 from __future__ import annotations
 
 import os
+import time
 
 import streamlit as st
 
@@ -26,6 +27,12 @@ from components.session_report import render_session_report
 from services import analytics, database as db, quiz_engine, session_manager
 
 POLL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
+
+# last_seen_at is presence-telemetry only (not currently read/displayed
+# anywhere in the app), so it doesn't need a DB write on every single
+# poll tick -- throttling it to roughly every 4th tick cuts a chunk of
+# per-participant write volume with no visible behavior change.
+TOUCH_MIN_INTERVAL_SECONDS = 8.0
 
 
 def render(on_switch_role) -> None:
@@ -140,11 +147,20 @@ def _render_session_screen(session_static: dict, participant_static: dict) -> No
         st.warning("Your participant record was not found.")
         return
 
-    db.touch_participant(participant_id)
+    touch_key = f"nbk_last_touch_{participant_id}"
+    now = time.monotonic()
+    if now - st.session_state.get(touch_key, 0.0) >= TOUCH_MIN_INTERVAL_SECONDS:
+        db.touch_participant(participant_id)
+        st.session_state[touch_key] = now
 
     st.markdown(f"**{session['title']}**  ·  👤 {participant['name']}")
     status = session["status"]
-    total_questions = quiz_engine.total_questions(session_id)
+    # Session questions are fixed for the session's whole lifetime, so
+    # the count is cached per-tab after the first tick instead of
+    # being re-queried via list_session_questions on every poll tick.
+    total_q_key = f"nbk_total_q_{session_id}"
+    total_questions = quiz_engine.total_questions(session_id, st.session_state.get(total_q_key))
+    st.session_state.setdefault(total_q_key, total_questions)
     progress_component.render_progress(session["current_question_index"], total_questions, status)
 
     if status == "WAITING":

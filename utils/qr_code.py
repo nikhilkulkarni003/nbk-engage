@@ -6,6 +6,7 @@ import io
 import os
 
 import qrcode
+import streamlit as st
 from qrcode.image.pil import PilImage
 
 from utils.network import get_lan_ip
@@ -37,7 +38,12 @@ def build_join_url(session_code: str, base_url: str | None = None) -> str:
     return f"{resolved}/?join={session_code}"
 
 
+@st.cache_data(show_spinner=False)
 def generate_qr_code_png(url: str) -> bytes:
+    """The join URL is constant for a session's whole lifetime, so the
+    PNG only needs to be generated once per unique URL rather than on
+    every 2-second host poll tick. Cached by url (the only argument),
+    so different sessions/codes each get their own correct image."""
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_M,

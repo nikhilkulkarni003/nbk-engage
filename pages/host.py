@@ -167,10 +167,16 @@ def _render_create_session_form() -> None:
 # ---------------------------------------------------------------
 @st.fragment(run_every=POLL_SECONDS)
 def _render_control_room(session_id: str) -> None:
-    state = session_manager.get_full_state(session_id)
+    # Session questions are fixed for a session's whole lifetime (never
+    # added to or removed from once it starts), so the count is cached
+    # per-tab after the first tick instead of being re-queried via
+    # list_session_questions on every single 2-second poll.
+    total_q_key = f"nbk_total_q_{session_id}"
+    state = session_manager.get_full_state(session_id, st.session_state.get(total_q_key))
     if not state:
         st.warning("Session not found.")
         return
+    st.session_state.setdefault(total_q_key, state["total_questions"])
     session = state["session"]
     cq = state["current_question"]
 
@@ -179,14 +185,31 @@ def _render_control_room(session_id: str) -> None:
         # session advances to the next question automatically (timer
         # expiry or everyone-answered) all the way up to the last
         # question's results -- no host click needed until the final
-        # "Reveal to Participants".
-        session_manager.auto_advance_deferred(session_id)
-        state = session_manager.get_full_state(session_id)
+        # "Reveal to Participants". Pass this tick's already-fetched
+        # state in so auto_advance_deferred doesn't re-query it, and
+        # only re-fetch full state if a transition actually happened.
+        transitioned = session_manager.auto_advance_deferred(
+            session_id,
+            session=state["session"],
+            sq=state["current_question"],
+            participant_count=state["participant_count"],
+            response_count=state["response_count"],
+        )
+        if transitioned is not None:
+            state = session_manager.get_full_state(session_id, st.session_state.get(total_q_key))
         session = state["session"]
         cq = state["current_question"]
     elif session["status"] == "QUESTION_ACTIVE":
-        session_manager.force_close_voting_if_timer_expired(session_id)
-        session = db.get_session(session_id)  # re-read in case it was just auto-closed
+        # Pass in what this tick already fetched instead of
+        # re-querying it inside force_close_voting_if_timer_expired,
+        # and use its return value directly instead of unconditionally
+        # re-reading the session "just in case" afterwards -- when
+        # nothing closed, the already-fetched `session` is still correct.
+        updated = session_manager.force_close_voting_if_timer_expired(
+            session_id, session=state["session"], sq=state["current_question"]
+        )
+        if updated is not None:
+            session = updated
 
     _render_header(session, state)
 
@@ -200,7 +223,7 @@ def _render_control_room(session_id: str) -> None:
     elif status == "RESULTS_REVEALED":
         _render_results_revealed(session, cq)
     elif status == "LEADERBOARD":
-        _render_leaderboard(session)
+        _render_leaderboard(session, state["total_questions"])
     elif status == "SESSION_ENDED":
         _render_session_ended(session)
 
@@ -210,7 +233,7 @@ def _render_control_room(session_id: str) -> None:
     # generic footer there to avoid duplicate buttons.
     is_final_screen = status == "SESSION_ENDED" or (
         status == "LEADERBOARD"
-        and not quiz_engine.has_next_question(session["id"], session["current_question_index"])
+        and not quiz_engine.has_next_question(session["id"], session["current_question_index"], state["total_questions"])
     )
     if not is_final_screen:
         _render_footer_controls(session)
@@ -319,8 +342,8 @@ def _render_results_revealed(session: dict, sq: dict) -> None:
         st.rerun()
 
 
-def _render_leaderboard(session: dict) -> None:
-    has_next = quiz_engine.has_next_question(session["id"], session["current_question_index"])
+def _render_leaderboard(session: dict, known_total_questions: int | None = None) -> None:
+    has_next = quiz_engine.has_next_question(session["id"], session["current_question_index"], known_total_questions)
 
     if not has_next:
         # Both reveal modes converge here: the last question is done,
@@ -341,6 +364,39 @@ def _render_leaderboard(session: dict) -> None:
         st.rerun()
 
 
+def _render_excel_export(session: dict, button_label: str) -> None:
+    """Building the export (a full-session analytics query -- every
+    question's responses/option breakdown -- plus the pandas/openpyxl
+    workbook itself) is expensive. Doing it unconditionally on every
+    2-second poll tick was the dominant source of both query volume
+    and CPU time on the host side. Instead, only compute it when the
+    trainer explicitly clicks to (re)generate it; the bytes are then
+    cached in this browser tab's session_state so subsequent ticks
+    just re-display them for free until the trainer asks again. This
+    is host-local UI convenience state, not shared live-session state
+    -- it doesn't affect what any other browser tab sees."""
+    cache_key = f"xlsx_bytes_{session['id']}"
+    prep_clicked = st.button(
+        f"🔄 Prepare Excel Export", key=f"prep_{cache_key}", use_container_width=True
+    )
+    if prep_clicked:
+        summary = analytics.get_session_summary(session["id"])
+        st.session_state[cache_key] = build_session_results_workbook(summary)
+
+    workbook_bytes = st.session_state.get(cache_key)
+    if workbook_bytes:
+        st.download_button(
+            button_label,
+            data=workbook_bytes,
+            file_name=f"nbk_engage_results_{session['session_code']}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"dl_{cache_key}",
+        )
+    else:
+        st.caption("Click “Prepare Excel Export” to generate the download.")
+
+
 def _render_group_summary_screen(session: dict) -> None:
     """The screen both reveal modes end at: an anonymous, group-level
     summary of the whole session, plus the controls the host needs to
@@ -359,15 +415,7 @@ def _render_group_summary_screen(session: dict) -> None:
             rows, previous_ranks_key=f"host_lb_final_{session['id']}", anonymize=False
         )
 
-    summary = analytics.get_session_summary(session["id"])
-    workbook_bytes = build_session_results_workbook(summary)
-    st.download_button(
-        "⬇️  Download Results (Excel)",
-        data=workbook_bytes,
-        file_name=f"nbk_engage_results_{session['session_code']}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    _render_excel_export(session, "⬇️  Download Results (Excel)")
 
     if session.get("group_summary_revealed_at"):
         st.success("✅ Revealed to participants")
@@ -395,15 +443,7 @@ def _render_footer_controls(session: dict) -> None:
     c1, c2 = st.columns(2)
     with c1:
         if session["status"] != "SESSION_ENDED":
-            summary = analytics.get_session_summary(session["id"])
-            workbook_bytes = build_session_results_workbook(summary)
-            st.download_button(
-                "⬇️  Download Results So Far",
-                data=workbook_bytes,
-                file_name=f"nbk_engage_results_{session['session_code']}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+            _render_excel_export(session, "⬇️  Download Results So Far")
     with c2:
         if session["status"] != "SESSION_ENDED":
             if st.button("⏹️  END SESSION", use_container_width=True):
