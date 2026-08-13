@@ -665,6 +665,29 @@ def count_responses(session_question_id: str) -> int:
     return row["c"] if row else 0
 
 
+def list_responses_for_session(session_id: str) -> list[dict]:
+    """Every response for every question in a session, in ONE round
+    trip -- used to build the whole-session group report/breakdown
+    (services/analytics.py::get_session_report and the per-question
+    result renderers it feeds) without looping list_responses/
+    get_option_counts once per question (an N+1 pattern that was
+    driving the host's Group Results screen to ~36 queries per poll
+    tick). Same row shape as list_responses(), just scoped by session
+    instead of a single session_question, so callers can group the
+    result by session_question_id in Python."""
+    return fetch_all(
+        """
+        select r.*, p.name as participant_name
+        from responses r
+        join participants p on p.id = r.participant_id
+        join session_questions sq on sq.id = r.session_question_id
+        where sq.session_id = :sid
+        order by r.submitted_at asc
+        """,
+        {"sid": session_id},
+    )
+
+
 def get_option_counts(session_question_id: str) -> list[dict]:
     return fetch_all(
         """

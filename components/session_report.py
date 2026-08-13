@@ -85,4 +85,4 @@ def render_session_report(session_id: str, chart_type: str = "bar",
             sq = row["session_question"]
             if sq["type"] == "MCQ" and sq.get("explanation"):
                 st.info(f"💡 {sq['explanation']}")
-            render_question_results(sq, chart_type=chart_type)
+            render_question_results(sq, chart_type=chart_type, responses=row.get("responses"))

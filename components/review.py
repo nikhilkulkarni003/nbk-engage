@@ -20,14 +20,27 @@ def render_full_review(session_id: str, participant_id: str | None = None,
     Host calls this with participant_id=None (sees group results only).
     A participant screen passes its own participant_id so each
     question also shows what THAT participant answered.
-    """
+
+    Fetches every response for the whole session in one query and
+    groups it in Python by question, instead of looping
+    get_response()/render_question_results() (which itself queries)
+    once per question -- was an N+1 identical to the one fixed in
+    services/analytics.py::get_session_report."""
     questions = quiz_engine.get_ordered_questions(session_id)
     if not questions:
         st.info("No questions in this session.")
         return
 
+    all_responses = db.list_responses_for_session(session_id)
+    responses_by_sq: dict[str, list[dict]] = {}
+    for r in all_responses:
+        responses_by_sq.setdefault(r["session_question_id"], []).append(r)
+
     for idx, sq in enumerate(questions):
-        response = db.get_response(sq["id"], participant_id) if participant_id else None
+        sq_responses = responses_by_sq.get(sq["id"], [])
+        response = None
+        if participant_id:
+            response = next((r for r in sq_responses if r["participant_id"] == participant_id), None)
 
         # Badge shown right on the collapsed row, so a participant can
         # scan pass/fail at a glance and only open the ones they got
@@ -68,4 +81,4 @@ def render_full_review(session_id: str, participant_id: str | None = None,
             if sq["type"] == "MCQ" and sq.get("explanation"):
                 st.info(f"💡 {sq['explanation']}")
 
-            render_question_results(sq, chart_type=chart_type)
+            render_question_results(sq, chart_type=chart_type, responses=sq_responses)

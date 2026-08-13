@@ -119,19 +119,20 @@ def test_session_report_computes_overall_accuracy_and_avg_time(monkeypatch):
         {"id": "sq1", "order_index": 0, "question_text": "2+2=?", "type": "MCQ"},
         {"id": "sq2", "order_index": 1, "question_text": "Pick a color", "type": "POLL"},
     ]
-    responses_by_sq = {
-        "sq1": [
-            {"is_correct": True, "response_time_ms": 2000},
-            {"is_correct": False, "response_time_ms": 4000},
-            {"is_correct": True, "response_time_ms": 3000},
-        ],
-        "sq2": [
-            {"is_correct": None, "response_time_ms": 1000},
-        ],
-    }
+    # get_session_report now fetches every response for the whole
+    # session in one query (list_responses_for_session) instead of
+    # looping list_responses() per question, so the mock is scoped the
+    # same way -- each row must carry session_question_id so the
+    # function can group them in Python.
+    all_responses = [
+        {"session_question_id": "sq1", "is_correct": True, "response_time_ms": 2000},
+        {"session_question_id": "sq1", "is_correct": False, "response_time_ms": 4000},
+        {"session_question_id": "sq1", "is_correct": True, "response_time_ms": 3000},
+        {"session_question_id": "sq2", "is_correct": None, "response_time_ms": 1000},
+    ]
     monkeypatch.setattr(db, "list_session_questions", lambda sid: sqs)
     monkeypatch.setattr(db, "list_participants", lambda sid: [{"id": "p1"}, {"id": "p2"}])
-    monkeypatch.setattr(db, "list_responses", lambda sqid: responses_by_sq[sqid])
+    monkeypatch.setattr(db, "list_responses_for_session", lambda sid: all_responses)
     monkeypatch.setattr(db, "get_leaderboard", lambda sid: [
         {"participant_id": "p1", "total_score": 2}, {"participant_id": "p2", "total_score": 0},
     ])
@@ -162,6 +163,7 @@ def test_session_report_computes_overall_accuracy_and_avg_time(monkeypatch):
 def test_session_report_handles_no_responses_at_all(monkeypatch):
     monkeypatch.setattr(db, "list_session_questions", lambda sid: [])
     monkeypatch.setattr(db, "list_participants", lambda sid: [])
+    monkeypatch.setattr(db, "list_responses_for_session", lambda sid: [])
     monkeypatch.setattr(db, "get_leaderboard", lambda sid: [])
     report = analytics.get_session_report("session1")
     assert report["total_questions"] == 0

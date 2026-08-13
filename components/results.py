@@ -142,24 +142,35 @@ def render_open_ended_list(responses: list[dict]) -> None:
         )
 
 
-def render_question_results(session_question: dict, chart_type: str = "bar") -> None:
+def render_question_results(session_question: dict, chart_type: str = "bar",
+                             responses: list[dict] | None = None) -> None:
     """Dispatches to the right renderer for a session_question's
     type. Shared by the host control room and the participant/host
     'review all questions' screen (DEFERRED reveal_mode), so both use
-    identical rendering logic."""
+    identical rendering logic.
+
+    `responses`, if provided, must already be this question's response
+    rows (see services/analytics.py::get_session_report, which fetches
+    the whole session's responses in one query and groups them by
+    question) -- passing it through here avoids each question's
+    expander on the Group Results screen re-querying independently.
+    Falls back to querying per-question when not supplied, which is
+    correct for the single-current-question call sites (live
+    QUESTION_ACTIVE/RESULTS_REVEALED screens)."""
     from services import analytics, database as db
     from components.wordcloud import render_wordcloud
 
     sq_type = session_question["type"]
     if sq_type in ("MCQ", "POLL"):
-        results = analytics.get_option_results(session_question)
+        results = analytics.get_option_results(session_question, responses)
         render_option_results(results, reveal_correct=(sq_type == "MCQ"), chart_type=chart_type)
     elif sq_type == "RATING":
-        render_rating_summary(analytics.get_rating_summary(session_question["id"]))
+        render_rating_summary(analytics.get_rating_summary(session_question["id"], responses))
     elif sq_type == "WORDCLOUD":
         cfg = session_question.get("config") or {}
         min_len = cfg.get("min_response_length", 2)
-        freq = analytics.get_word_frequencies(session_question["id"], min_length=min_len)
-        render_wordcloud(freq, db.count_responses(session_question["id"]))
+        freq = analytics.get_word_frequencies(session_question["id"], min_length=min_len, responses=responses)
+        count = len(responses) if responses is not None else db.count_responses(session_question["id"])
+        render_wordcloud(freq, count)
     elif sq_type == "OPEN_ENDED":
-        render_open_ended_list(analytics.get_open_ended_responses(session_question["id"]))
+        render_open_ended_list(analytics.get_open_ended_responses(session_question["id"], responses))

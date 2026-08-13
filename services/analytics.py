@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import string
 from collections import Counter
+from typing import Optional
 
 from wordcloud import STOPWORDS
 
@@ -39,12 +40,22 @@ def get_question_options(session_question: dict) -> list[tuple[str, str]]:
     return options
 
 
-def get_option_results(session_question: dict) -> list[dict]:
-    """Live results for MCQ / POLL questions: option, count, pct."""
-    counts_by_letter = {
-        row["answer_text"]: row["response_count"]
-        for row in db.get_option_counts(session_question["id"])
-    }
+def get_option_results(session_question: dict, responses: Optional[list[dict]] = None) -> list[dict]:
+    """Live results for MCQ / POLL questions: option, count, pct.
+
+    `responses`, if provided, must already be this question's response
+    rows (e.g. a session-wide fetch grouped in Python by the caller --
+    see get_session_report) so this doesn't issue its own
+    get_option_counts query. Falls back to querying when not supplied,
+    which is exactly right for the single current-question case (host/
+    participant QUESTION_ACTIVE and RESULTS_REVEALED screens)."""
+    if responses is not None:
+        counts_by_letter: dict[str, int] = Counter(r["answer_text"] for r in responses)
+    else:
+        counts_by_letter = {
+            row["answer_text"]: row["response_count"]
+            for row in db.get_option_counts(session_question["id"])
+        }
     options = get_question_options(session_question)
     total = sum(counts_by_letter.values())
     results = []
@@ -61,8 +72,8 @@ def get_option_results(session_question: dict) -> list[dict]:
     return results
 
 
-def get_rating_summary(session_question_id: str) -> dict:
-    responses = db.list_responses(session_question_id)
+def get_rating_summary(session_question_id: str, responses: Optional[list[dict]] = None) -> dict:
+    responses = responses if responses is not None else db.list_responses(session_question_id)
     values = []
     for r in responses:
         try:
@@ -77,8 +88,8 @@ def get_rating_summary(session_question_id: str) -> dict:
     return {"average": average, "distribution": distribution, "total": len(values)}
 
 
-def get_open_ended_responses(session_question_id: str) -> list[dict]:
-    responses = db.list_responses(session_question_id)
+def get_open_ended_responses(session_question_id: str, responses: Optional[list[dict]] = None) -> list[dict]:
+    responses = responses if responses is not None else db.list_responses(session_question_id)
     return [
         {"participant_name": r["participant_name"], "answer_text": r["answer_text"],
          "submitted_at": r["submitted_at"]}
@@ -89,11 +100,12 @@ def get_open_ended_responses(session_question_id: str) -> list[dict]:
 _WORD_RE = re.compile(r"[a-zA-Z']+")
 
 
-def get_word_frequencies(session_question_id: str, min_length: int = 2, top_n: int = 100) -> list[dict]:
+def get_word_frequencies(session_question_id: str, min_length: int = 2, top_n: int = 100,
+                          responses: Optional[list[dict]] = None) -> list[dict]:
     """Tokenizes all free-text answers for a WORDCLOUD question,
     normalizes case, strips punctuation, drops stopwords/short words,
     and returns [{"word": ..., "count": ...}, ...] sorted by frequency."""
-    responses = db.list_responses(session_question_id)
+    responses = responses if responses is not None else db.list_responses(session_question_id)
     stopwords = STOPWORDS | EXTRA_STOPWORDS
     counter: Counter[str] = Counter()
     for r in responses:
@@ -159,9 +171,24 @@ def get_session_summary(session_id: str) -> dict:
 def get_session_report(session_id: str) -> dict:
     """Overall accuracy + per-question correct/incorrect breakdown for
     the in-browser session report (components/session_report.py) --
-    the on-screen equivalent of the Excel export's summary numbers."""
+    the on-screen equivalent of the Excel export's summary numbers.
+
+    Previously issued one list_responses() query per session_question
+    (an N+1 that, combined with the per-question result renderers each
+    also querying independently, was driving the host's Group Results
+    screen to ~36 queries every poll tick). Now fetches every
+    response for the whole session in a single round trip and groups
+    it in Python by session_question_id -- the per-question rows in
+    "responses" are handed back so callers (session_report.py) can
+    pass them straight into render_question_results(...) instead of
+    it re-querying per question too."""
     session_questions = db.list_session_questions(session_id)
     participants = db.list_participants(session_id)
+    all_responses = db.list_responses_for_session(session_id)
+
+    responses_by_sq: dict[str, list[dict]] = {}
+    for r in all_responses:
+        responses_by_sq.setdefault(r["session_question_id"], []).append(r)
 
     total_correct = 0
     total_incorrect = 0
@@ -169,7 +196,7 @@ def get_session_report(session_id: str) -> dict:
     per_question = []
 
     for sq in session_questions:
-        responses = db.list_responses(sq["id"])
+        responses = responses_by_sq.get(sq["id"], [])
         correct_count = incorrect_count = None
         if sq["type"] == "MCQ":
             correct_count = sum(1 for r in responses if r["is_correct"] is True)
@@ -192,6 +219,7 @@ def get_session_report(session_id: str) -> dict:
             "accuracy_pct": round(correct_count / answered * 100, 1) if answered else None,
             "avg_time_sec": avg_time_sec,
             "session_question": sq,
+            "responses": responses,
         })
 
     total_scored = total_correct + total_incorrect

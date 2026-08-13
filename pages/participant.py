@@ -6,9 +6,20 @@ No login. Identity for a browser tab is just (participant_id,
 session_id) held in st.session_state -- purely local UI state that
 tells this tab *which* database rows to read. The actual session
 state, question, timer and results always come fresh from the
-database on every poll tick, so a page refresh never loses shared
-state (only the "which session am I in" pointer, which is why we
-re-validate everything against the DB below).
+database, so a page refresh never loses shared state (only the "which
+session am I in" pointer, which is why we re-validate everything
+against the DB below).
+
+Rendering is deliberately split two ways so the auto-refresh needed
+for live polling doesn't grey out the question/answer UI while a
+participant is reading or about to tap an option:
+  - _poll_for_changes: a tiny @st.fragment(run_every=...) that renders
+    nothing, just detects whether shared state changed and triggers a
+    full st.rerun() when it has.
+  - _render_session_body: a plain function (not a fragment) that does
+    the actual rendering, invoked on load and on real transitions only.
+  - _render_timer_only: the one exception -- an isolated fragment just
+    for the countdown number/progress bar, so it still visibly ticks.
 """
 
 from __future__ import annotations
@@ -45,19 +56,32 @@ def render(on_switch_role) -> None:
         _render_join_screen(on_switch_role)
         return
 
-    session = db.get_session(st.session_state["p_session_id"])
+    session_id = st.session_state["p_session_id"]
+    participant_id = st.session_state["p_participant_id"]
+
+    session = db.get_session(session_id)
     if not session:
         st.warning("This session no longer exists.")
         _render_leave_button()
         return
 
-    participant = db.get_participant(st.session_state["p_participant_id"])
+    participant = db.get_participant(participant_id)
     if not participant:
         st.warning("We couldn't find your participant record (maybe the session was reset).")
         _render_leave_button()
         return
 
-    _render_session_screen(session, participant)
+    # Lightweight background poll (~3 queries, renders nothing itself)
+    # that only triggers a full-page st.rerun() when shared session
+    # state has actually changed -- see _poll_for_changes. The actual
+    # question/answer UI (_render_session_body) is a plain function,
+    # NOT an auto-refreshing fragment, so it is never greyed out by
+    # Streamlit's per-fragment refresh while a participant is reading
+    # the question or about to tap an option; it only re-renders when
+    # a real transition happens (or on initial load / a user action).
+    _poll_for_changes(session_id, participant_id)
+
+    _render_session_body(session, participant)
 
 
 def _render_join_screen(on_switch_role) -> None:
@@ -134,47 +158,78 @@ def _render_leave_button() -> None:
 
 
 @st.fragment(run_every=POLL_SECONDS)
-def _render_session_screen(session_static: dict, participant_static: dict) -> None:
-    # TEMPORARY diagnostics (see services/diagnostics.py) -- start_poll/
-    # end_poll bracket the whole fragment execution; the try/finally
-    # guarantees end_poll (and its summary line) always fires, even on
-    # an early return or an unhandled exception.
+def _poll_for_changes(session_id: str, participant_id: str) -> None:
+    """The ONLY thing that auto-refreshes every POLL_SECONDS. Renders
+    nothing -- it just checks whether shared session state has changed
+    since this browser tab last rendered (question advanced, voting
+    closed, results revealed, someone else joined, etc.) via a cheap
+    ~3-query fingerprint, and calls st.rerun() (a full page rerun) only
+    when it has. Because it renders no UI, there is nothing for
+    Streamlit's per-fragment refresh dimming to grey out -- the actual
+    question/answer widgets live in _render_session_body, a plain
+    function outside any fragment, so they stay static and tappable
+    between real transitions instead of flashing on every tick."""
     diagnostics.start_poll("PARTICIPANT_POLL")
     diagnostics.mark("fragment_start")
     try:
-        session_id = session_static["id"]
-        participant_id = participant_static["id"]
-
         session = db.get_session(session_id)
         diagnostics.mark("get_session_done")
         if not session:
-            st.warning("This session no longer exists.")
             return
-        participant = db.get_participant(participant_id)
-        diagnostics.mark("get_participant_done")
-        if not participant:
-            st.warning("Your participant record was not found.")
-            return
+
+        sq_id = session.get("current_session_question_id")
+        my_response = db.get_response(sq_id, participant_id) if sq_id else None
+        diagnostics.mark("get_response_done")
+
+        participant_count = db.count_participants(session_id)
+        diagnostics.mark("count_participants_done")
+
+        fingerprint = (
+            session["status"],
+            session["current_question_index"],
+            sq_id,
+            my_response["id"] if my_response else None,
+            session.get("group_summary_revealed_at"),
+            participant_count,
+        )
+        fp_key = f"nbk_p_fingerprint_{session_id}_{participant_id}"
+        if st.session_state.get(fp_key) != fingerprint:
+            st.session_state[fp_key] = fingerprint
+            diagnostics.mark("change_detected_triggering_rerun")
+            st.rerun()
+        else:
+            diagnostics.mark("no_change_detected")
+    finally:
+        diagnostics.end_poll(pool_stats=db.get_pool_stats(), label="PARTICIPANT_POLL")
+
+
+def _render_session_body(session: dict, participant: dict) -> None:
+    """The actual question/answer UI. NOT an auto-refreshing fragment --
+    runs once on initial load and again only when _poll_for_changes
+    detects a real transition (or on any normal user interaction,
+    e.g. clicking an answer button, same as any other Streamlit
+    widget). See the module docstring and _poll_for_changes above."""
+    diagnostics.start_poll("PARTICIPANT_RENDER")
+    diagnostics.mark("render_start")
+    try:
+        session_id = session["id"]
+        participant_id = participant["id"]
 
         touch_key = f"nbk_last_touch_{participant_id}"
         now = time.monotonic()
         if now - st.session_state.get(touch_key, 0.0) >= TOUCH_MIN_INTERVAL_SECONDS:
             db.touch_participant(participant_id)
             st.session_state[touch_key] = now
-            diagnostics.mark("touch_participant_done(executed=True)")
-        else:
-            diagnostics.mark("touch_participant_done(executed=False, throttled)")
 
         st.markdown(f"**{session['title']}**  ·  👤 {participant['name']}")
         status = session["status"]
         # Session questions are fixed for the session's whole lifetime, so
         # the count is cached per-tab after the first tick instead of
-        # being re-queried via list_session_questions on every poll tick.
+        # being re-queried via list_session_questions on every render.
         total_q_key = f"nbk_total_q_{session_id}"
         cached_total = st.session_state.get(total_q_key)
         total_questions = quiz_engine.total_questions(session_id, cached_total)
         st.session_state.setdefault(total_q_key, total_questions)
-        diagnostics.mark(f"total_questions_done(cache_hit={cached_total is not None})")
         progress_component.render_progress(session["current_question_index"], total_questions, status)
 
         if status == "WAITING":
@@ -182,10 +237,10 @@ def _render_session_screen(session_static: dict, participant_static: dict) -> No
         elif status == "SESSION_ENDED":
             _render_session_ended(session, participant)
         else:
-            diagnostics.mark("before_get_session_question")
+            diagnostics.mark("before_get_current_question")
             sq = db.get_session_question(session["current_session_question_id"]) if session.get(
                 "current_session_question_id") else None
-            diagnostics.mark("after_get_session_question")
+            diagnostics.mark("after_get_current_question")
             if not sq:
                 _render_waiting(session)
                 return
@@ -199,10 +254,10 @@ def _render_session_screen(session_static: dict, participant_static: dict) -> No
                 _render_leaderboard(session, participant)
 
         st.markdown("---")
-        diagnostics.mark("main_render_done")
+        _render_leave_button()
+        diagnostics.mark("render_done")
     finally:
-        diagnostics.end_poll(pool_stats=db.get_pool_stats(), label="PARTICIPANT_POLL")
-    _render_leave_button()
+        diagnostics.end_poll(pool_stats=db.get_pool_stats(), label="PARTICIPANT_RENDER")
 
 
 def _render_waiting(session: dict) -> None:
@@ -211,13 +266,25 @@ def _render_waiting(session: dict) -> None:
     st.caption(f"{count} participant(s) have joined so far.")
 
 
+@st.fragment(run_every=POLL_SECONDS)
+def _render_timer_only(started_at, timer_seconds) -> None:
+    """The countdown/progress-bar is isolated in its own tiny
+    auto-refreshing fragment so it keeps visibly ticking down, while
+    the question text and answer buttons in _render_question_active
+    (below) are NOT inside any fragment and are therefore never
+    greyed out by this refresh -- only this small bar redraws every
+    tick, not the tappable options around it."""
+    timer_component.render_timer(started_at, timer_seconds)
+
+
 def _render_question_active(session: dict, sq: dict, participant: dict) -> None:
     existing = db.get_response(sq["id"], participant["id"])
     diagnostics.mark("get_response_done")
 
     question_card.render_question_prompt(sq)
     diagnostics.mark("question_rendering_done")
-    remaining = timer_component.render_timer(sq.get("started_at"), sq.get("timer_seconds"))
+    _render_timer_only(sq.get("started_at"), sq.get("timer_seconds"))
+    remaining = timer_component.seconds_remaining(sq.get("started_at"), sq.get("timer_seconds"))
     diagnostics.mark("timer_rendering_done")
 
     if existing:
