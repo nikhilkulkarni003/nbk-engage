@@ -1,0 +1,32 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+venv/
+.venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Exports / generated artifacts
+exports/
+*.xlsx
+!database/sample_question_bank.xlsx
+!database/sample_question_template.xlsx
+
+# IDE
+.vscode/
+.idea/
+.claude/

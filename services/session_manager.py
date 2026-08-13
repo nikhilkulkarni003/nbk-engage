@@ -1,0 +1,288 @@
+"""
+Session state machine.
+
+sessions.status is the single source of truth for where a live
+session is in its lifecycle. There are two paths through it,
+selected per-session by sessions.reveal_mode:
+
+  INSTANT (default, classic Kahoot-style):
+    WAITING --start_session-->
+    QUESTION_ACTIVE --close_voting-->
+    VOTING_CLOSED --reveal_answer-->
+    RESULTS_REVEALED --show_leaderboard-->
+    LEADERBOARD --next_question--> QUESTION_ACTIVE (loops)
+                --next_question (no more questions)--> SESSION_ENDED
+
+  DEFERRED (exam/survey-style -- nothing is revealed until every
+  question has been answered):
+    WAITING --start_session-->
+    QUESTION_ACTIVE --close_voting-->
+    VOTING_CLOSED --next_question (not the last question)--> QUESTION_ACTIVE (loops)
+    VOTING_CLOSED --reveal_all_and_show_leaderboard (last question)--> LEADERBOARD
+    LEADERBOARD --next_question (no more questions)--> SESSION_ENDED
+
+    (any state) --end_session--> SESSION_ENDED
+
+Every transition here re-reads the session row from the database
+first and validates the current status before writing, so two
+browser tabs (e.g. host double-clicking, or a stale page) can never
+push the session into an invalid state. Which of the two paths above
+is legal at a given moment is a host.py/UI concern (it only offers
+the buttons that make sense for the session's reveal_mode) -- the
+transition table itself just needs to allow both paths to exist.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from services import database as db
+from services import quiz_engine
+from services import scoring
+
+VALID_TRANSITIONS = {
+    "WAITING": {"QUESTION_ACTIVE"},
+    "QUESTION_ACTIVE": {"VOTING_CLOSED", "SESSION_ENDED"},
+    "VOTING_CLOSED": {"RESULTS_REVEALED", "QUESTION_ACTIVE", "LEADERBOARD", "SESSION_ENDED"},
+    "RESULTS_REVEALED": {"LEADERBOARD", "SESSION_ENDED"},
+    "LEADERBOARD": {"QUESTION_ACTIVE", "SESSION_ENDED"},
+    "SESSION_ENDED": set(),
+}
+
+
+class InvalidTransitionError(ValueError):
+    pass
+
+
+class VotingClosedError(ValueError):
+    pass
+
+
+class SessionEndedError(ValueError):
+    pass
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _require_transition(current_status: str, target_status: str) -> None:
+    allowed = VALID_TRANSITIONS.get(current_status, set())
+    if target_status not in allowed:
+        raise InvalidTransitionError(
+            f"Cannot move from {current_status} to {target_status}."
+        )
+
+
+def create_session(title: str, question_set_id: str, host_name: str,
+                    scoring_config: dict | None = None,
+                    reveal_mode: str = "INSTANT",
+                    anonymous_leaderboard: bool = False) -> dict:
+    session = db.create_session(
+        title, question_set_id, host_name, scoring_config,
+        reveal_mode=reveal_mode, anonymous_leaderboard=anonymous_leaderboard,
+    )
+    quiz_engine.build_session_questions(session["id"], question_set_id)
+    return session
+
+
+def get_full_state(session_id: str) -> dict:
+    """Everything a host/participant screen needs for one poll cycle."""
+    session = db.get_session(session_id)
+    if not session:
+        return {}
+    current_q = None
+    if session.get("current_session_question_id"):
+        current_q = db.get_session_question(session["current_session_question_id"])
+    return {
+        "session": session,
+        "current_question": current_q,
+        "participant_count": db.count_participants(session_id),
+        "response_count": db.count_responses(current_q["id"]) if current_q else 0,
+        "total_questions": quiz_engine.total_questions(session_id),
+    }
+
+
+def start_session(session_id: str) -> dict:
+    session = db.get_session(session_id)
+    _require_transition(session["status"], "QUESTION_ACTIVE")
+    first_q = quiz_engine.get_question_at_index(session_id, 0)
+    if not first_q:
+        raise ValueError("No questions available to start this session.")
+    db.mark_question_started(first_q["id"])
+    return db.update_session(
+        session_id,
+        status="QUESTION_ACTIVE",
+        current_question_index=0,
+        current_session_question_id=first_q["id"],
+        started_at=_now(),
+    )
+
+
+def close_voting(session_id: str) -> dict:
+    session = db.get_session(session_id)
+    _require_transition(session["status"], "VOTING_CLOSED")
+    if session.get("current_session_question_id"):
+        db.mark_question_closed(session["current_session_question_id"])
+    return db.update_session(session_id, status="VOTING_CLOSED")
+
+
+def reveal_answer(session_id: str) -> dict:
+    session = db.get_session(session_id)
+    _require_transition(session["status"], "RESULTS_REVEALED")
+    if session.get("current_session_question_id"):
+        db.mark_question_revealed(session["current_session_question_id"])
+    return db.update_session(session_id, status="RESULTS_REVEALED")
+
+
+def show_leaderboard(session_id: str) -> dict:
+    session = db.get_session(session_id)
+    _require_transition(session["status"], "LEADERBOARD")
+    return db.update_session(session_id, status="LEADERBOARD")
+
+
+def reveal_all_and_show_leaderboard(session_id: str) -> dict:
+    """DEFERRED reveal_mode only: called once, after the LAST
+    question's voting has closed. Reveals every question in the
+    session at once (rather than one at a time) and jumps straight
+    to the leaderboard."""
+    session = db.get_session(session_id)
+    _require_transition(session["status"], "LEADERBOARD")
+    db.mark_all_questions_revealed(session_id)
+    return db.update_session(session_id, status="LEADERBOARD")
+
+
+def next_question(session_id: str) -> dict:
+    session = db.get_session(session_id)
+    _require_transition(session["status"], "QUESTION_ACTIVE")
+    next_index = session["current_question_index"] + 1
+    next_q = quiz_engine.get_question_at_index(session_id, next_index)
+    if not next_q:
+        return end_session(session_id)
+    db.mark_question_started(next_q["id"])
+    return db.update_session(
+        session_id,
+        status="QUESTION_ACTIVE",
+        current_question_index=next_index,
+        current_session_question_id=next_q["id"],
+    )
+
+
+def end_session(session_id: str) -> dict:
+    return db.update_session(session_id, status="SESSION_ENDED", ended_at=_now())
+
+
+def submit_answer(session_id: str, session_question_id: str, participant_id: str,
+                   answer_text: str) -> dict:
+    """Validates that voting is actually open, computes response_time_ms
+    from the server-stored question start time (never trusting a
+    client-supplied timestamp), scores the answer server-side, and
+    writes the response. Relies on the DB's unique constraint (via
+    database.insert_response) to make duplicate-answer prevention
+    atomic even under concurrent requests."""
+    session = db.get_session(session_id)
+    if not session or session["status"] == "SESSION_ENDED":
+        raise SessionEndedError("This session has ended.")
+    if session["status"] != "QUESTION_ACTIVE" or session["current_session_question_id"] != session_question_id:
+        raise VotingClosedError("Voting is closed for this question.")
+
+    sq = db.get_session_question(session_question_id)
+    if not sq:
+        raise ValueError("Question not found.")
+
+    response_time_ms = None
+    if sq.get("started_at"):
+        started_at = sq["started_at"]
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        response_time_ms = max(0, int((_now() - started_at).total_seconds() * 1000))
+
+    is_correct, points = scoring.score_response(
+        question_type=sq["type"],
+        answer_text=answer_text,
+        session_question=sq,
+        response_time_ms=response_time_ms,
+        scoring_config=session.get("scoring_config"),
+    )
+
+    return db.insert_response(
+        session_question_id=session_question_id,
+        participant_id=participant_id,
+        answer_text=answer_text,
+        is_correct=is_correct,
+        response_time_ms=response_time_ms,
+        points_awarded=points,
+    )
+
+
+def force_close_voting_if_timer_expired(session_id: str) -> dict | None:
+    """Called by the host poll loop: if a timer was configured and has
+    elapsed, auto-close voting server-side so latecomers cannot answer
+    after time is up, even if the host's own click lags."""
+    session = db.get_session(session_id)
+    if session["status"] != "QUESTION_ACTIVE":
+        return None
+    sq = db.get_session_question(session["current_session_question_id"])
+    if not sq or not sq.get("timer_seconds") or not sq.get("started_at"):
+        return None
+    started_at = sq["started_at"]
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    elapsed = (_now() - started_at).total_seconds()
+    if elapsed >= sq["timer_seconds"]:
+        return close_voting(session_id)
+    return None
+
+
+def auto_advance_deferred(session_id: str) -> dict | None:
+    """DEFERRED reveal_mode only: fully hands-off question flow. Voting
+    closes automatically once the timer expires OR every joined
+    participant has answered (whichever comes first), and the session
+    immediately moves to the next question with no host click needed.
+
+    On the LAST question, it stops one step short of broadcasting to
+    participants: it auto-advances the host into the terminal
+    LEADERBOARD state (via reveal_all_and_show_leaderboard, so the
+    host can already see the group results) but does NOT set
+    group_summary_revealed_at -- that stays a deliberate host action
+    ("Reveal to Participants"), identical to per-question mode's
+    manual final reveal.
+    """
+    session = db.get_session(session_id)
+    if not session or session["reveal_mode"] != "DEFERRED":
+        return None
+
+    if session["status"] == "QUESTION_ACTIVE":
+        sq = db.get_session_question(session["current_session_question_id"])
+        if not sq or not sq.get("started_at"):
+            return None
+
+        participant_count = db.count_participants(session_id)
+        response_count = db.count_responses(sq["id"])
+        everyone_answered = participant_count > 0 and response_count >= participant_count
+
+        timer_expired = False
+        if sq.get("timer_seconds"):
+            started_at = sq["started_at"]
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            timer_expired = (_now() - started_at).total_seconds() >= sq["timer_seconds"]
+
+        if not (timer_expired or everyone_answered):
+            return None
+        session = close_voting(session_id)
+
+    if session["status"] == "VOTING_CLOSED":
+        if quiz_engine.has_next_question(session_id, session["current_question_index"]):
+            return next_question(session_id)
+        return reveal_all_and_show_leaderboard(session_id)
+
+    return None
+
+
+def reveal_group_summary_to_participants(session_id: str) -> dict:
+    """The host's explicit 'Reveal to Participants' action on the
+    final group results screen. Works identically for both reveal
+    modes -- it's a flag, not a status transition, so it doesn't go
+    through _require_transition."""
+    return db.reveal_group_summary(session_id)
