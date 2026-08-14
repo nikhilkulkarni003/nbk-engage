@@ -344,3 +344,141 @@ def test_reveal_group_summary_to_participants_sets_timestamp(sample_session):
     # Idempotent -- calling it again doesn't error and stays revealed.
     revealed_again = session_manager.reveal_group_summary_to_participants(session["id"])
     assert revealed_again["group_summary_revealed_at"] is not None
+
+
+# ---------------------------------------------------------------
+# SELF_PACED pacing_mode: every participant answers/skips all
+# questions independently (no shared current question, no timer,
+# no host click needed between questions) instead of the host
+# broadcasting one shared current question.
+# ---------------------------------------------------------------
+@pytest.fixture()
+def self_paced_session(sample_set):
+    qs, questions = sample_set
+    session = session_manager.create_session(
+        title="__test_self_paced_session__", question_set_id=qs["id"], host_name="Test Host",
+        pacing_mode="SELF_PACED",
+    )
+    yield session, questions
+    db.execute("delete from sessions where id = :id", {"id": session["id"]})
+
+
+def test_self_paced_session_is_created_with_pacing_mode(self_paced_session):
+    session, _ = self_paced_session
+    assert session["pacing_mode"] == "SELF_PACED"
+
+
+def test_starting_self_paced_session_starts_every_question_at_once(self_paced_session):
+    session, questions = self_paced_session
+    started = session_manager.start_session_self_paced(session["id"])
+    assert started["status"] == "SELF_PACED_ACTIVE"
+
+    sqs = quiz_engine.get_ordered_questions(session["id"])
+    assert len(sqs) == 2
+    assert all(sq["started_at"] is not None for sq in sqs)
+
+
+def test_self_paced_participants_can_answer_out_of_order(self_paced_session):
+    session, questions = self_paced_session
+    session_manager.start_session_self_paced(session["id"])
+    p1 = db.join_session(session["id"], "Alice")
+    sqs = quiz_engine.get_ordered_questions(session["id"])
+
+    # Answer the SECOND question first -- no single shared "current
+    # question" gate should prevent this, unlike host-paced submit_answer.
+    response = session_manager.submit_answer_or_skip(
+        session["id"], sqs[1]["id"], p1["id"], "Red"
+    )
+    assert response["answer_text"] == "Red"
+    assert response["is_skipped"] is False
+
+
+def test_self_paced_skip_is_never_scored(self_paced_session):
+    session, questions = self_paced_session
+    session_manager.start_session_self_paced(session["id"])
+    p1 = db.join_session(session["id"], "Alice")
+    sqs = quiz_engine.get_ordered_questions(session["id"])
+
+    response = session_manager.submit_answer_or_skip(
+        session["id"], sqs[0]["id"], p1["id"], answer_text=None, is_skipped=True
+    )
+    assert response["is_skipped"] is True
+    assert response["answer_text"] is None
+    assert response["is_correct"] is None
+    assert response["points_awarded"] == 0
+
+
+def test_self_paced_duplicate_answer_is_rejected(self_paced_session):
+    session, questions = self_paced_session
+    session_manager.start_session_self_paced(session["id"])
+    p1 = db.join_session(session["id"], "Alice")
+    sqs = quiz_engine.get_ordered_questions(session["id"])
+
+    session_manager.submit_answer_or_skip(session["id"], sqs[0]["id"], p1["id"], "B")
+    with pytest.raises(db.DuplicateAnswerError):
+        session_manager.submit_answer_or_skip(session["id"], sqs[0]["id"], p1["id"], "C")
+
+
+def test_self_paced_progress_tracks_answered_and_skipped(self_paced_session):
+    session, questions = self_paced_session
+    session_manager.start_session_self_paced(session["id"])
+    p1 = db.join_session(session["id"], "Alice")
+    p2 = db.join_session(session["id"], "Bob")
+    sqs = quiz_engine.get_ordered_questions(session["id"])
+
+    session_manager.submit_answer_or_skip(session["id"], sqs[0]["id"], p1["id"], "B")
+    session_manager.submit_answer_or_skip(session["id"], sqs[1]["id"], p1["id"], answer_text=None, is_skipped=True)
+    session_manager.submit_answer_or_skip(session["id"], sqs[0]["id"], p2["id"], "B")
+
+    progress = db.get_self_paced_progress(session["id"])
+    by_id = {row["participant_id"]: row for row in progress}
+    assert by_id[p1["id"]]["completed_count"] == 2
+    assert by_id[p1["id"]]["skipped_count"] == 1
+    assert by_id[p2["id"]]["completed_count"] == 1
+    assert by_id[p2["id"]]["skipped_count"] == 0
+
+
+def test_auto_close_self_paced_waits_until_everyone_finishes(self_paced_session):
+    session, questions = self_paced_session
+    session_manager.start_session_self_paced(session["id"])
+    p1 = db.join_session(session["id"], "Alice")
+    p2 = db.join_session(session["id"], "Bob")
+    sqs = quiz_engine.get_ordered_questions(session["id"])
+
+    # Alice finishes both questions, Bob hasn't answered anything yet.
+    session_manager.submit_answer_or_skip(session["id"], sqs[0]["id"], p1["id"], "B")
+    session_manager.submit_answer_or_skip(session["id"], sqs[1]["id"], p1["id"], "Red")
+
+    result = session_manager.auto_close_self_paced_if_everyone_done(session["id"])
+    assert result is None
+    still_active = db.get_session(session["id"])
+    assert still_active["status"] == "SELF_PACED_ACTIVE"
+
+    # Bob finishes too (one answer, one skip) -- now everyone's done.
+    session_manager.submit_answer_or_skip(session["id"], sqs[0]["id"], p2["id"], "B")
+    session_manager.submit_answer_or_skip(session["id"], sqs[1]["id"], p2["id"], answer_text=None, is_skipped=True)
+
+    closed = session_manager.auto_close_self_paced_if_everyone_done(session["id"])
+    assert closed is not None
+    assert closed["status"] == "LEADERBOARD"
+
+    sqs_after = quiz_engine.get_ordered_questions(session["id"])
+    assert all(sq["revealed_at"] is not None for sq in sqs_after)
+
+
+def test_self_paced_manual_close_and_reveal(self_paced_session):
+    session, questions = self_paced_session
+    session_manager.start_session_self_paced(session["id"])
+    db.join_session(session["id"], "Alice")  # hasn't answered anything
+
+    # Host can close early even if nobody's finished.
+    closed = session_manager.close_and_reveal_self_paced(session["id"])
+    assert closed["status"] == "LEADERBOARD"
+
+
+def test_self_paced_cannot_be_submitted_to_before_starting(self_paced_session):
+    session, questions = self_paced_session
+    p1 = db.join_session(session["id"], "Alice")
+    sqs = quiz_engine.get_ordered_questions(session["id"])
+    with pytest.raises(session_manager.VotingClosedError):
+        session_manager.submit_answer_or_skip(session["id"], sqs[0]["id"], p1["id"], "B")

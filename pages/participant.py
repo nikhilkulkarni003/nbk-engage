@@ -236,6 +236,8 @@ def _render_session_body(session: dict, participant: dict) -> None:
             _render_waiting(session)
         elif status == "SESSION_ENDED":
             _render_session_ended(session, participant)
+        elif status == "SELF_PACED_ACTIVE":
+            _render_self_paced_active(session, participant)
         else:
             diagnostics.mark("before_get_current_question")
             sq = db.get_session_question(session["current_session_question_id"]) if session.get(
@@ -331,6 +333,90 @@ def _submit(session_id: str, sq_id: str, participant_id: str, answer: str) -> No
         st.error("Couldn't submit your answer. Please try again.")
 
 
+def _render_self_paced_active(session: dict, participant: dict) -> None:
+    """SELF_PACED pacing_mode: there is no single shared current
+    question, so each participant works out their own next one
+    locally -- the full question list is fetched once and cached for
+    the rest of the session (it's immutable), and "which one is next"
+    is computed from this participant's own responses (answered or
+    skipped) with no server round trip needed beyond those two reads.
+    Submitting/skipping writes immediately (see submit_answer_or_skip)
+    and reruns, so the very next script pass just recomputes the next
+    question from the now-updated response list -- no polling needed
+    to advance, it's entirely driven by the participant's own action."""
+    session_id = session["id"]
+    participant_id = participant["id"]
+
+    q_cache_key = f"nbk_sp_questions_{session_id}"
+    if q_cache_key not in st.session_state:
+        st.session_state[q_cache_key] = quiz_engine.get_ordered_questions(session_id)
+    questions = st.session_state[q_cache_key]
+
+    if not questions:
+        st.info("This session has no questions.")
+        return
+
+    my_responses = db.list_responses_for_participant(session_id, participant_id)
+    diagnostics.mark("list_responses_for_participant_done")
+    done_ids = {r["session_question_id"] for r in my_responses}
+    remaining = [q for q in questions if q["id"] not in done_ids]
+    total = len(questions)
+    done_count = total - len(remaining)
+
+    progress_component.render_progress(done_count, total, "QUESTION_ACTIVE")
+
+    if not remaining:
+        st.success("✅ You've answered every question!")
+        st.info("⏳ Waiting for the host to close the session and share results...")
+        return
+
+    sq = remaining[0]
+    question_card.render_question_prompt(sq)
+
+    answer = None
+    if sq["type"] in ("MCQ", "POLL"):
+        answer = question_card.render_mcq_or_poll_buttons(sq, key_prefix=f"sp_ans_{sq['id']}")
+    elif sq["type"] == "RATING":
+        answer = question_card.render_rating_buttons(sq, key_prefix=f"sp_rate_{sq['id']}")
+    elif sq["type"] in ("WORDCLOUD", "OPEN_ENDED"):
+        answer = question_card.render_free_text_answer(sq, key_prefix=f"sp_text_{sq['id']}")
+
+    if answer is not None:
+        _submit_self_paced(session_id, sq["id"], participant_id, answer, is_skipped=False)
+
+    if st.button("⏭️  Skip this question", use_container_width=True, key=f"sp_skip_{sq['id']}"):
+        _submit_self_paced(session_id, sq["id"], participant_id, None, is_skipped=True)
+
+
+def _submit_self_paced(session_id: str, sq_id: str, participant_id: str,
+                        answer: str | None, is_skipped: bool) -> None:
+    if not is_skipped:
+        from utils.validation import validate_free_text_answer
+
+        if answer is None or len(answer) > 200:
+            st.error("Response is too long.")
+            return
+        ok, _ = validate_free_text_answer(answer, min_length=1, max_length=200)
+        if not ok:
+            st.error("Please enter a valid response.")
+            return
+    try:
+        session_manager.submit_answer_or_skip(
+            session_id, sq_id, participant_id, answer, is_skipped=is_skipped
+        )
+        st.rerun()
+    except session_manager.VotingClosedError:
+        st.warning("This session isn't accepting answers right now.")
+    except db.DuplicateAnswerError:
+        # Already answered/skipped (e.g. a double-click) -- just
+        # refresh, which will move on to the next question.
+        st.rerun()
+    except session_manager.SessionEndedError:
+        st.warning("This session has ended.")
+    except Exception:  # noqa: BLE001
+        st.error("Couldn't submit your answer. Please try again.")
+
+
 def _render_voting_closed(sq: dict, participant: dict) -> None:
     st.caption("🔒 Voting closed")
     question_card.render_question_prompt(sq)
@@ -371,7 +457,13 @@ def _render_results(sq: dict, participant: dict) -> None:
 
 
 def _render_leaderboard(session: dict, participant: dict) -> None:
-    has_next = quiz_engine.has_next_question(session["id"], session["current_question_index"])
+    # SELF_PACED sessions never set current_question_index, so the
+    # generic index-based has-next check doesn't apply here -- see the
+    # matching guard in pages/host.py::_render_leaderboard.
+    has_next = (
+        session.get("pacing_mode") != "SELF_PACED"
+        and quiz_engine.has_next_question(session["id"], session["current_question_index"])
+    )
 
     if not has_next:
         # Both reveal modes converge here -- the final, anonymous group

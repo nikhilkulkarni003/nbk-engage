@@ -107,12 +107,30 @@ def _render_create_session_form() -> None:
             }
         set_label = st.selectbox("Question Set", options=list(set_options.keys()) if set_options else ["—"])
 
+        st.markdown("**How should participants answer?**")
+        pacing_choice = st.radio(
+            "Pacing", label_visibility="collapsed",
+            options=[
+                "Host-paced (one question at a time, with a timer)",
+                "Self-paced (everyone answers independently, with Skip, no timer)",
+            ],
+        )
+        pacing_mode = "HOST_PACED" if pacing_choice.startswith("Host-paced") else "SELF_PACED"
+
         st.markdown("**When should results be revealed?**")
         reveal_choice = st.radio(
             "Reveal mode", label_visibility="collapsed",
             options=["Per question (reveal after each one closes)", "All at once (reveal everything at the end)"],
         )
-        reveal_mode = "INSTANT" if reveal_choice.startswith("Per question") else "DEFERRED"
+        if pacing_mode == "SELF_PACED":
+            st.caption(
+                "Self-paced sessions always reveal everything together at the end "
+                "(there's no single shared question to reveal one at a time), "
+                "regardless of the choice above."
+            )
+            reveal_mode = "DEFERRED"
+        else:
+            reveal_mode = "INSTANT" if reveal_choice.startswith("Per question") else "DEFERRED"
 
         anonymous_leaderboard = st.checkbox(
             "Hide participant names from each other on the leaderboard "
@@ -153,6 +171,7 @@ def _render_create_session_form() -> None:
                 scoring_config=scoring_config,
                 reveal_mode=reveal_mode,
                 anonymous_leaderboard=anonymous_leaderboard,
+                pacing_mode=pacing_mode,
             )
         except ValueError as exc:
             st.error(str(exc))
@@ -189,8 +208,28 @@ def _render_control_room(session_id: str) -> None:
         st.session_state.setdefault(total_q_key, state["total_questions"])
         session = state["session"]
         cq = state["current_question"]
+        self_paced_progress = None
 
-        if session["reveal_mode"] == "DEFERRED" and session["status"] in ("QUESTION_ACTIVE", "VOTING_CLOSED"):
+        if session.get("pacing_mode") == "SELF_PACED" and session["status"] == "SELF_PACED_ACTIVE":
+            # Self-paced: every participant answers/skips independently
+            # (no single shared current question, no timer). One
+            # aggregate query gets everyone's progress, used both for
+            # the auto-close check below AND the progress panel
+            # (_render_self_paced_active reuses it instead of
+            # re-querying).
+            self_paced_progress = db.get_self_paced_progress(session_id)
+            diagnostics.mark("self_paced_progress_fetched")
+            transitioned = session_manager.auto_close_self_paced_if_everyone_done(
+                session_id, session=state["session"], progress=self_paced_progress,
+                total_questions=state["total_questions"],
+            )
+            diagnostics.mark(f"auto_close_self_paced_done(transitioned={transitioned is not None})")
+            if transitioned is not None:
+                state = session_manager.get_full_state(session_id, st.session_state.get(total_q_key))
+                session = state["session"]
+                cq = state["current_question"]
+                self_paced_progress = None
+        elif session["reveal_mode"] == "DEFERRED" and session["status"] in ("QUESTION_ACTIVE", "VOTING_CLOSED"):
             # All-at-once mode is fully hands-off: voting closes and the
             # session advances to the next question automatically (timer
             # expiry or everyone-answered) all the way up to the last
@@ -230,6 +269,8 @@ def _render_control_room(session_id: str) -> None:
         status = session["status"]
         if status == "WAITING":
             _render_waiting(session)
+        elif status == "SELF_PACED_ACTIVE":
+            _render_self_paced_active(session, state, self_paced_progress)
         elif status == "QUESTION_ACTIVE":
             _render_question_active(session, cq)
         elif status == "VOTING_CLOSED":
@@ -245,10 +286,15 @@ def _render_control_room(session_id: str) -> None:
         # The terminal group-summary screen (shown by _render_leaderboard
         # once there's no next question, and always by _render_session_ended)
         # already has its own Download/End Session controls -- skip the
-        # generic footer there to avoid duplicate buttons.
-        is_final_screen = status == "SESSION_ENDED" or (
+        # generic footer there to avoid duplicate buttons. SELF_PACED_ACTIVE
+        # has its own Close & Reveal button in _render_self_paced_active,
+        # same reasoning.
+        is_final_screen = status in ("SESSION_ENDED", "SELF_PACED_ACTIVE") or (
             status == "LEADERBOARD"
-            and not quiz_engine.has_next_question(session["id"], session["current_question_index"], state["total_questions"])
+            and (
+                session.get("pacing_mode") == "SELF_PACED"
+                or not quiz_engine.has_next_question(session["id"], session["current_question_index"], state["total_questions"])
+            )
         )
         if not is_final_screen:
             _render_footer_controls(session)
@@ -310,8 +356,49 @@ def _render_waiting(session: dict) -> None:
         st.caption("No one has joined yet. Share the code / QR code above.")
     if st.button("▶️  START SESSION", type="primary", use_container_width=True):
         try:
-            session_manager.start_session(session["id"])
+            if session.get("pacing_mode") == "SELF_PACED":
+                session_manager.start_session_self_paced(session["id"])
+            else:
+                session_manager.start_session(session["id"])
         except ValueError as exc:
+            st.error(str(exc))
+        st.rerun()
+
+
+def _render_self_paced_active(session: dict, state: dict, progress: list[dict] | None = None) -> None:
+    """SELF_PACED pacing_mode's control room: no single current
+    question to show (see components/progress.py) -- instead, a live
+    per-participant progress panel, and a manual close, since it also
+    closes automatically once everyone's finished (see
+    session_manager.auto_close_self_paced_if_everyone_done, called
+    every poll tick in _render_control_room)."""
+    st.markdown("#### 📝 Self-paced -- participants are answering independently")
+    st.caption(
+        "No timer. Each participant works through every question at their own "
+        "speed and can skip. Closes automatically once everyone has finished "
+        "every question, or close it early below."
+    )
+
+    total = state["total_questions"]
+    progress = progress if progress is not None else db.get_self_paced_progress(session["id"])
+
+    if not progress or total <= 0:
+        st.info("Waiting for participants to join and start answering...")
+    else:
+        finished = sum(1 for row in progress if row["completed_count"] >= total)
+        st.metric("Finished all questions", f"{finished} / {len(progress)}")
+        for row in progress:
+            pct = min(1.0, row["completed_count"] / total)
+            label = f"{row['participant_name']} — {row['completed_count']} of {total}"
+            if row["skipped_count"]:
+                label += f" ({row['skipped_count']} skipped)"
+            st.progress(pct, text=label)
+
+    st.markdown("---")
+    if st.button("🏁  Close & Reveal Results", type="primary", use_container_width=True):
+        try:
+            session_manager.close_and_reveal_self_paced(session["id"])
+        except session_manager.InvalidTransitionError as exc:
             st.error(str(exc))
         st.rerun()
 
@@ -363,7 +450,16 @@ def _render_results_revealed(session: dict, sq: dict) -> None:
 
 
 def _render_leaderboard(session: dict, known_total_questions: int | None = None) -> None:
-    has_next = quiz_engine.has_next_question(session["id"], session["current_question_index"], known_total_questions)
+    # SELF_PACED sessions never set current_question_index (there's no
+    # single shared "current question" to track), so the generic
+    # index-based has-next check doesn't apply -- self-paced always
+    # lands straight on the group summary screen, matching how
+    # close_and_reveal_self_paced/auto_close_self_paced_if_everyone_done
+    # jump directly to LEADERBOARD with everything already revealed.
+    has_next = (
+        session.get("pacing_mode") != "SELF_PACED"
+        and quiz_engine.has_next_question(session["id"], session["current_question_index"], known_total_questions)
+    )
 
     if not has_next:
         # Both reveal modes converge here: the last question is done,

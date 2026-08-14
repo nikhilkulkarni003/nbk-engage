@@ -376,10 +376,11 @@ def _generate_session_code() -> str:
 def create_session(title: str, question_set_id: str, host_name: str,
                     scoring_config: Optional[dict] = None,
                     reveal_mode: str = "INSTANT",
-                    anonymous_leaderboard: bool = False) -> dict:
+                    anonymous_leaderboard: bool = False,
+                    pacing_mode: str = "HOST_PACED") -> dict:
     code = _generate_session_code()
     cols = ["session_code", "title", "question_set_id", "host_name",
-            "reveal_mode", "anonymous_leaderboard"]
+            "reveal_mode", "anonymous_leaderboard", "pacing_mode"]
     params = {
         "code": code,
         "title": title,
@@ -387,6 +388,7 @@ def create_session(title: str, question_set_id: str, host_name: str,
         "host_name": host_name,
         "reveal_mode": reveal_mode,
         "anonymous_leaderboard": anonymous_leaderboard,
+        "pacing_mode": pacing_mode,
     }
     if scoring_config is not None:
         cols.append("scoring_config")
@@ -530,6 +532,21 @@ def mark_all_questions_revealed(session_id: str) -> None:
     )
 
 
+def mark_all_questions_started(session_id: str) -> None:
+    """Used by SELF_PACED pacing_mode: every question becomes
+    answerable at once (no single shared "current question"), so all
+    of them get started_at set in one UPDATE when the host starts the
+    session, instead of one at a time as the host/timer advances."""
+    execute(
+        """
+        update session_questions
+        set started_at = coalesce(started_at, now())
+        where session_id = :sid
+        """,
+        {"sid": session_id},
+    )
+
+
 def reveal_group_summary(session_id: str) -> dict:
     """Pushes the group results summary to participant screens (see
     services/session_manager.py::reveal_group_summary_to_participants).
@@ -611,21 +628,23 @@ def get_response(session_question_id: str, participant_id: str) -> Optional[dict
     )
 
 
-def insert_response(session_question_id: str, participant_id: str, answer_text: str,
+def insert_response(session_question_id: str, participant_id: str, answer_text: Optional[str],
                      is_correct: Optional[bool], response_time_ms: Optional[int],
-                     points_awarded: int) -> dict:
+                     points_awarded: int, is_skipped: bool = False) -> dict:
     """Atomic insert; relies on the unique(session_question_id, participant_id)
     constraint so a race between two rapid submits from the same participant
-    can never produce two rows."""
+    can never produce two rows. A skip (SELF_PACED pacing_mode) is just a
+    row with is_skipped=True and answer_text=None -- same write path,
+    same duplicate-prevention guarantee as a real answer."""
     with get_conn() as conn:
         result = conn.execute(
             text(
                 """
                 insert into responses
                     (session_question_id, participant_id, answer_text, is_correct,
-                     response_time_ms, points_awarded)
+                     response_time_ms, points_awarded, is_skipped)
                 values
-                    (:sqid, :pid, :answer, :is_correct, :rt, :points)
+                    (:sqid, :pid, :answer, :is_correct, :rt, :points, :is_skipped)
                 on conflict (session_question_id, participant_id) do nothing
                 returning *
                 """
@@ -637,11 +656,30 @@ def insert_response(session_question_id: str, participant_id: str, answer_text: 
                 "is_correct": is_correct,
                 "rt": response_time_ms,
                 "points": points_awarded,
+                "is_skipped": is_skipped,
             },
         ).mappings().first()
     if result is None:
         raise DuplicateAnswerError("You have already answered this question.")
     return dict(result)
+
+
+def list_responses_for_participant(session_id: str, participant_id: str) -> list[dict]:
+    """Every response (answered or skipped) this one participant has
+    made in this session, in ONE query. Used by SELF_PACED pacing_mode
+    to work out "which question should this participant see next"
+    locally -- there is no single shared current question to ask the
+    server for, so each participant's own responses (not everyone
+    else's, unlike list_responses_for_session) are all that's needed."""
+    return fetch_all(
+        """
+        select r.*
+        from responses r
+        join session_questions sq on sq.id = r.session_question_id
+        where sq.session_id = :sid and r.participant_id = :pid
+        """,
+        {"sid": session_id, "pid": participant_id},
+    )
 
 
 def list_responses(session_question_id: str) -> list[dict]:
@@ -683,6 +721,35 @@ def list_responses_for_session(session_id: str) -> list[dict]:
         join session_questions sq on sq.id = r.session_question_id
         where sq.session_id = :sid
         order by r.submitted_at asc
+        """,
+        {"sid": session_id},
+    )
+
+
+def get_self_paced_progress(session_id: str) -> list[dict]:
+    """One row per participant who has joined: how many of this
+    session's questions they've dealt with so far (answered OR
+    skipped -- both are rows in `responses`) and how many of those
+    were skips. Used by the host's SELF_PACED_ACTIVE progress panel
+    and by the auto-close check (has everyone finished every
+    question?) -- a single aggregate query instead of looping per
+    participant."""
+    return fetch_all(
+        """
+        select
+            p.id as participant_id,
+            p.name as participant_name,
+            count(r.id) as completed_count,
+            count(r.id) filter (where r.is_skipped) as skipped_count
+        from participants p
+        left join responses r
+            on r.participant_id = p.id
+            and r.session_question_id in (
+                select id from session_questions where session_id = :sid
+            )
+        where p.session_id = :sid
+        group by p.id, p.name
+        order by p.joined_at asc
         """,
         {"sid": session_id},
     )

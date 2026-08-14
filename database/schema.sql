@@ -141,12 +141,21 @@ create table if not exists sessions (
     status                      text not null default 'WAITING'
                                     check (status in (
                                         'WAITING', 'QUESTION_ACTIVE', 'VOTING_CLOSED',
-                                        'RESULTS_REVEALED', 'LEADERBOARD', 'SESSION_ENDED'
+                                        'RESULTS_REVEALED', 'LEADERBOARD', 'SESSION_ENDED',
+                                        'SELF_PACED_ACTIVE'
                                     )),
     current_question_index     integer not null default -1,
     current_session_question_id uuid,  -- FK added below (circular w/ session_questions)
     reveal_mode                 text not null default 'INSTANT'
                                     check (reveal_mode in ('INSTANT', 'DEFERRED')),
+    -- HOST_PACED: existing/default behavior -- one shared current
+    -- question, host or timer controls advancing.
+    -- SELF_PACED: every participant works through all questions
+    -- independently (with a Skip option); the host sees live
+    -- per-participant progress and closes & reveals manually, or it
+    -- closes automatically once everyone has finished every question.
+    pacing_mode                  text not null default 'HOST_PACED'
+                                    check (pacing_mode in ('HOST_PACED', 'SELF_PACED')),
     anonymous_leaderboard        boolean not null default false,
     -- Set once the host clicks "Reveal to Participants" on the final
     -- group results screen (both reveal modes converge there). Distinct
@@ -237,11 +246,16 @@ create table if not exists responses (
     id                      uuid primary key default gen_random_uuid(),
     session_question_id     uuid not null references session_questions(id) on delete cascade,
     participant_id          uuid not null references participants(id) on delete cascade,
-    answer_text             text not null,       -- 'A'/'B'/'C'/'D' (MCQ/POLL), free text (WORDCLOUD/OPEN_ENDED), '1'-'5' (RATING)
+    answer_text             text,       -- 'A'/'B'/'C'/'D' (MCQ/POLL), free text (WORDCLOUD/OPEN_ENDED), '1'-'5' (RATING); null when is_skipped
     is_correct              boolean,
     response_time_ms        integer,
     points_awarded          integer not null default 0,
     submitted_at            timestamptz not null default now(),
+    -- A skipped question (SELF_PACED mode's Skip button) still gets a
+    -- row here so per-participant progress ("dealt with every
+    -- question yet?") is derived the same way as answered ones --
+    -- one write path, no separate skips table.
+    is_skipped              boolean not null default false,
     unique (session_question_id, participant_id)
 );
 

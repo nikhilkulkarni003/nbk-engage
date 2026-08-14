@@ -49,12 +49,19 @@ def get_option_results(session_question: dict, responses: Optional[list[dict]] =
     get_option_counts query. Falls back to querying when not supplied,
     which is exactly right for the single current-question case (host/
     participant QUESTION_ACTIVE and RESULTS_REVEALED screens)."""
+    # A skipped question (SELF_PACED pacing_mode) has answer_text=None
+    # -- it must not count toward the option percentages/total, or
+    # every question's percentages would be diluted by however many
+    # people skipped it.
     if responses is not None:
-        counts_by_letter: dict[str, int] = Counter(r["answer_text"] for r in responses)
+        counts_by_letter: dict[str, int] = Counter(
+            r["answer_text"] for r in responses if not r.get("is_skipped") and r.get("answer_text")
+        )
     else:
         counts_by_letter = {
             row["answer_text"]: row["response_count"]
             for row in db.get_option_counts(session_question["id"])
+            if row["answer_text"]
         }
     options = get_question_options(session_question)
     total = sum(counts_by_letter.values())
@@ -94,6 +101,7 @@ def get_open_ended_responses(session_question_id: str, responses: Optional[list[
         {"participant_name": r["participant_name"], "answer_text": r["answer_text"],
          "submitted_at": r["submitted_at"]}
         for r in responses
+        if not r.get("is_skipped")  # a skip has no text worth listing
     ]
 
 

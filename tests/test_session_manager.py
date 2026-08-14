@@ -44,6 +44,19 @@ def test_cannot_transition_out_of_ended_session():
         _require_transition("SESSION_ENDED", "WAITING")
 
 
+def test_waiting_can_start_self_paced():
+    _require_transition("WAITING", "SELF_PACED_ACTIVE")  # should not raise
+
+
+def test_self_paced_active_can_close_to_leaderboard():
+    _require_transition("SELF_PACED_ACTIVE", "LEADERBOARD")  # should not raise
+
+
+def test_self_paced_active_cannot_skip_straight_to_session_ended_via_question_active():
+    with pytest.raises(InvalidTransitionError):
+        _require_transition("SELF_PACED_ACTIVE", "QUESTION_ACTIVE")
+
+
 def test_end_session_bypasses_the_transition_table():
     # end_session() is intentionally unconditional -- the host's "End
     # Session" control must work from any screen (WAITING included),

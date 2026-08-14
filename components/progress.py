@@ -20,6 +20,13 @@ def render_progress(current_question_index: int, total_questions: int, status: s
     elif status == "SESSION_ENDED":
         position = total_questions
         label = f"All {total_questions} question(s) complete"
+    elif status == "SELF_PACED_ACTIVE":
+        # Self-paced has no single shared "current question" (every
+        # participant progresses independently) -- their own per-
+        # participant progress is shown elsewhere, so this bar just
+        # signals the phase rather than a fake shared position.
+        st.progress(0.5, text=f"In progress · {total_questions} question(s) · everyone answering at their own pace")
+        return
     else:
         position = min(current_question_index + 1, total_questions)
         label = f"Question {position} of {total_questions}"
