@@ -72,7 +72,16 @@ git commit -m "Initial commit: NBK Engage"
    - `DATABASE_URL` — your Supabase connection string (same one in your local `.env`)
    - `ADMIN_PASSWORD` — your trainer login password
    - `APP_BASE_URL` — leave this until Step 4, then come back and set it to `https://engage.yourhappinesspartner.in`
-4. Pick the **Starter** plan (~$7/month) rather than Free. Free-tier Render services spin down after 15 minutes idle and take 30-60 seconds to wake up on the next request — exactly the kind of delay that ruins a live quiz moment if a participant hits it while the service was asleep between sessions. Starter stays on.
+4. Pick a plan. `render.yaml` in this repo defaults to **Free** (what this
+   project actually runs on). Free-tier Render services spin down after 15
+   minutes idle and take 30-60 seconds to wake up on the next request — if a
+   participant hits the app right as it's waking up, that first request is
+   slow. In practice this is manageable for a scheduled training session
+   (open the app yourself a minute or two before people join, so it's
+   already awake), but if you're running unscheduled/drop-in sessions where
+   that wake-up delay would be disruptive, upgrade to **Starter** (~$7/month,
+   stays on) instead — edit `plan:` in `render.yaml` or change it in Render's
+   dashboard under Settings → Instance Type.
 5. Click **Deploy**. First build takes a few minutes; watch the logs for `You can now view your Streamlit app`.
 6. Once deployed, Render gives you a `https://nbk-engage-xxxx.onrender.com` URL — confirm the app loads there before moving to DNS.
 

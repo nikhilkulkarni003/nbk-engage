@@ -28,7 +28,8 @@ Admin browser ──┘        │                           └── Participa
 
 - **Streamlit is a rendering + input layer only.** `st.session_state` is used
   strictly for *local, per-tab* UI bookkeeping (e.g. "which session_id is
-  this browser currently looking at"). Every piece of shared state — session
+  this browser currently looking at", cached immutable question lists,
+  prepared Excel export bytes). Every piece of shared state — session
   status, the active question, who has joined, every answer, every score —
   lives in Postgres. That's what lets a host's laptop and ten participants'
   phones all agree on what's happening right now.
@@ -36,57 +37,75 @@ Admin browser ──┘        │                           └── Participa
   (every `POLL_INTERVAL_SECONDS`, default 2s) to re-read the database and
   redraw just the live portion of the screen. This was a deliberate choice
   over WebSockets/Supabase Realtime for the MVP — see [§9](#9-design-notes--known-limitations).
+  Both host and participant screens are split so the polling fragment does
+  the minimum necessary read + a change check, and the actual question/
+  answer UI only re-renders on a real state change — not on every tick — so
+  it never flickers or greys out while someone is mid-tap.
 - **Scoring is always computed server-side** (`services/scoring.py` +
   `services/session_manager.py`), from the question's stored correct answer
   and a server-measured response time. The client only ever sends "which
   option did the participant pick" — never a score.
+- **Two pacing models, chosen per session:**
+  - **Host-paced** — the classic model: one shared question at a time, no
+    timer, the host manually closes voting and advances (or, in *all-at-once*
+    reveal mode, it advances itself once everyone's answered — see below).
+  - **Self-paced** — every participant works through all questions
+    independently, in any order, with a **Skip** option, at their own speed.
+    The host sees live per-participant progress and closes/reveals manually,
+    or it closes automatically once everyone has finished.
 - **The session lifecycle is an explicit state machine**
-  (`services/session_manager.py`): `WAITING → QUESTION_ACTIVE → VOTING_CLOSED
-  → RESULTS_REVEALED → LEADERBOARD → (loops to QUESTION_ACTIVE, or) →
-  SESSION_ENDED`. Every transition re-reads the current status from the
-  database and validates it before writing, so a stale tab or a double-click
-  can't corrupt the flow.
+  (`services/session_manager.py`): host-paced runs
+  `WAITING → QUESTION_ACTIVE → VOTING_CLOSED → RESULTS_REVEALED → LEADERBOARD
+  → (loops to QUESTION_ACTIVE, or) → SESSION_ENDED`; self-paced runs
+  `WAITING → SELF_PACED_ACTIVE → LEADERBOARD → SESSION_ENDED`. Every
+  transition re-reads the current status from the database and validates it
+  before writing, so a stale tab or a double-click can't corrupt the flow.
+- **Participants only ever see their own results** — correct/incorrect count
+  and accuracy percentage, never group-level charts or the ranked
+  leaderboard. Group results (donut chart, per-question breakdown, ranked
+  leaderboard with everyone's names/scores) are visible to the host/trainer
+  only, on the control-room screen.
 
 ### Project structure
 
 ```
 app.py                     Entry point + routing (host/participant/admin) + global CSS
 pages/
-  host.py                  Trainer console: create/run a session, control room
-  participant.py           Join → wait → answer → results → leaderboard
-  admin.py                 Question bank, question sets, Excel import, past sessions
+  host.py                  Trainer console: create/run a session (host-paced or self-paced), control room
+  participant.py           Join → wait → answer → personal results (never group results)
+  admin.py                 Question sets (create/edit/import nested inside each set), past sessions
 components/
   question_card.py         Question prompt, answer widgets, read-only host options preview
-  timer.py                 Server-time-based countdown
   progress.py              "Question X of N" progress bar shown to host + participants
-  leaderboard.py           Ranked leaderboard with medals, rank-change arrows, anonymize option
-  results.py               Live result bars/pie charts, rating summary, open-ended list
-  review.py                Personal per-question review with pass/fail badge (participant's own answers)
-  session_report.py        The anonymous "Group Results" screen (donut, tiles, per-question breakdown)
-  wordcloud.py             Multi-color word cloud image rendering
+  leaderboard.py           Ranked leaderboard with medals, rank-change arrows, anonymize option (host-only view)
+  results.py               Live result bars/pie charts, rating summary, word cloud, open-ended list (host-only)
+  review.py                Per-question review with pass/fail badge (a participant's own answers)
+  session_report.py        The "Group Results" screen (donut, tiles, per-question breakdown) — host-only
+  wordcloud.py              Multi-color word cloud image rendering
 services/
-  database.py              The ONLY module that talks SQL (SQLAlchemy + psycopg2)
-  session_manager.py       Session state machine + server-side answer submission
-  quiz_engine.py           Question sequencing / snapshotting a set into a session
-  scoring.py                Pure scoring math (no DB) — 1 point per correct answer by default
-  analytics.py              Poll/MCQ result %, word-cloud frequencies, leaderboard, exports
+  database.py               The ONLY module that talks SQL (SQLAlchemy + psycopg2)
+  session_manager.py        Session state machine (both pacing models) + server-side answer submission
+  quiz_engine.py            Question sequencing / snapshotting a set into a session
+  scoring.py                 Pure scoring math (no DB) — 1 point per correct answer by default
+  analytics.py               Poll/MCQ result %, word-cloud frequencies, leaderboard, exports
+  diagnostics.py             Temporary poll-cycle timing/query instrumentation — see §9
 utils/
-  excel_import.py          Bulk question upload + validation + template generator
-  excel_export.py          Multi-sheet results workbook (participants/scores/results/raw)
-  qr_code.py                Join-link QR code generation (auto-detects LAN IP)
-  network.py                 LAN IP detection backing the QR code
-  validation.py             Shared input validation (names, codes, question rows)
-  auth.py                   Simple shared-password gate for host/admin
+  excel_import.py           Bulk question upload straight into a question set + validation + template generator
+  excel_export.py           Multi-sheet results workbook (participants/scores/results/raw), built on demand
+  qr_code.py                 Join-link QR code generation (auto-detects LAN IP), cached per URL
+  network.py                  LAN IP detection backing the QR code
+  validation.py              Shared input validation (names, codes, question rows)
+  auth.py                    Simple shared-password gate for host/admin
 database/
-  schema.sql                 Full Postgres schema (tables, views, constraints, triggers)
-  migrations/                 Incremental ALTERs for installs that ran an older schema.sql
-  seed_questions.py          Seeds 14 sample finance questions + a ready-to-run set
-  sample_question_bank.xlsx  The same 14 questions in the Excel import format
-tests/                        pytest suite (unit + DB integration)
-"Start NBK Engage.bat"        Windows launcher: sets up + starts the server + opens the trainer app window
-_open_app_window.bat           Helper invoked by the launcher (waits for the server, opens Edge app mode)
-DEPLOYMENT.md                  Full deployment guide: instant internet (ngrok) + permanent custom domain
-render.yaml                    Render.com blueprint used by DEPLOYMENT.md's deploy path
+  schema.sql                  Full Postgres schema (tables, views, constraints, triggers) -- fresh installs use this
+  migrations/                  Incremental ALTERs for installs that ran an older schema.sql
+  seed_questions.py           Seeds 14 sample finance questions + a ready-to-run set
+  sample_question_bank.xlsx   The same 14 questions in the Excel import format
+tests/                         pytest suite (unit + DB integration)
+"Start NBK Engage.bat"         Windows launcher: sets up + starts the server + opens the app window
+_open_app_window.bat            Helper invoked by the launcher (waits for the server, opens Edge app mode)
+DEPLOYMENT.md                   Full deployment guide: instant internet (ngrok) + permanent custom domain
+render.yaml                     Render.com blueprint used by DEPLOYMENT.md's deploy path
 ```
 
 ---
@@ -107,16 +126,19 @@ render.yaml                    Render.com blueprint used by DEPLOYMENT.md's depl
    tables, the `session_leaderboard` / `session_question_results` views,
    indexes and triggers. It's safe to re-run.
 3. Get your connection string: **Project Settings → Database → Connection
-   string → URI**. Prefer the **Session pooler** variant if offered — it
-   plays nicer with Streamlit's connection pooling than a direct connection.
-   It looks like:
+   string → URI**. Use the **Session pooler** or **Transaction pooler**
+   variant, not the direct connection — the direct-connection host is
+   IPv6-only unless you pay for Supabase's IPv4 add-on, which many hosting
+   platforms (including some Streamlit/Render environments) can't reach
+   reliably, causing slow/failed connections. It looks like:
 
    ```
-   postgresql://postgres.xxxxxxxx:YOUR_PASSWORD@aws-0-<region>.pooler.supabase.com:6543/postgres
+   postgresql://postgres.xxxxxxxx:YOUR_PASSWORD@aws-0-<region>.pooler.supabase.com:5432/postgres
    ```
 
-   If your password contains special characters (`@`, `#`, `%`, ...), URL-encode
-   them (`@` → `%40`, etc.).
+   (Port `5432` = Session pooler, `6543` = Transaction pooler — either works;
+   this project runs on the Session pooler.) If your password contains
+   special characters (`@`, `#`, `%`, ...), URL-encode them (`@` → `%40`, etc.).
 
 > **Already ran an earlier version of `schema.sql`?** Also run everything in
 > `database/migrations/` (in order) in the SQL Editor:
@@ -125,8 +147,11 @@ render.yaml                    Render.com blueprint used by DEPLOYMENT.md's depl
 > default scoring from 1000-points-plus-bonus to flat 1-point-per-correct-
 > answer; [`002_group_summary_reveal.sql`](database/migrations/002_group_summary_reveal.sql)
 > adds the column backing the "Reveal to Participants" action on the group
-> results screen. Both are safe to re-run; brand-new installs get everything
-> from `schema.sql` directly and don't need either.
+> results screen; [`003_self_paced_mode.sql`](database/migrations/003_self_paced_mode.sql)
+> adds self-paced mode + the Skip option (`sessions.pacing_mode`,
+> `responses.is_skipped`, and the `SELF_PACED_ACTIVE` session status). All
+> three are safe to re-run; brand-new installs get everything from
+> `schema.sql` directly and don't need any of them.
 
 ---
 
@@ -135,13 +160,15 @@ render.yaml                    Render.com blueprint used by DEPLOYMENT.md's depl
 **Windows shortcut:** once your `.env` is configured (step 3 below), you can
 skip everything else and just double-click **`Start NBK Engage.bat`** in the
 project folder — it creates the virtual environment and installs
-dependencies on first run, then starts the server and opens the Trainer
-Console in its own chromeless app window (via Edge `--app` mode, using the
-helper script `_open_app_window.bat`) rather than a regular browser tab, so
-it feels like a native app on your desktop. Keep the console window open
-while running a session; closing it stops the app. Participants always join
-from their own separate, ordinary phone browser — this app-window behavior
-only affects your own trainer screen.
+dependencies on first run, then starts the server and opens NBK Engage in
+its own chromeless app window (via Edge `--app` mode, using the helper
+script `_open_app_window.bat`) rather than a regular browser tab, so it
+feels like a native app on your desktop. It opens on the same participant
+join screen as the deployed web URL — expand **"Are you the trainer?"** to
+get to the host console from there. Keep the console window open while
+running a session; closing it stops the app. Participants always join from
+their own separate, ordinary phone browser — this app-window behavior only
+affects your own screen.
 
 Otherwise, the manual steps:
 
@@ -172,13 +199,20 @@ Open the URL Streamlit prints (default `http://localhost:8501`).
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `DATABASE_URL` | **Yes** | Supabase Postgres connection string. The app refuses to do anything DB-backed without it, and shows a friendly error instead of crashing. |
+| `DATABASE_URL` | **Yes** | Supabase Postgres connection string (pooler host, see §3). The app refuses to do anything DB-backed without it, and shows a friendly error instead of crashing. |
 | `ADMIN_PASSWORD` | **Yes** | Shared password gating the Host and Admin areas. Participants never see or need this. **Change it from the default before sharing the app with anyone.** |
 | `APP_NAME` | No | Cosmetic; shown in the browser tab. |
-| `APP_BASE_URL` | No | Join URL / QR code base. Leave at the localhost placeholder for classroom use — the app auto-detects this machine's LAN IP instead. Only set this if you deploy to a real public URL. See [§5](#5-network-access-getting-phones-to-connect). |
+| `APP_BASE_URL` | No | Join URL / QR code base. Leave at the localhost placeholder for classroom/local-demo use — the app auto-detects this machine's LAN IP instead. Set this to your real deployed URL (e.g. `https://nbk-engage.onrender.com`) when deployed, so the QR code points at the live server instead of your laptop. See [§5](#5-network-access-getting-phones-to-connect). |
 | `APP_PORT` | No | Port used when building the LAN join URL (default `8501`, matches Streamlit's default port). |
-| `POLL_INTERVAL_SECONDS` | No | How often host/participant screens re-check the database (default 2s). |
+| `POLL_INTERVAL_SECONDS` | No | How often host/participant screens re-check the database (default 2s; keep at 2-3s). |
 | `SUPABASE_URL` / `SUPABASE_ANON_KEY` / `SUPABASE_SERVICE_ROLE_KEY` | No | Reserved for future use (e.g. Supabase Storage for question images). Not required for the MVP's core functionality — the app talks to Postgres directly via `DATABASE_URL`. **Never** put the service-role key anywhere participant-facing. |
+
+> **Running locally while also deployed:** if you run the app locally (e.g.
+> for a demo) while it's also deployed elsewhere, point both at the **same**
+> `DATABASE_URL` (so they share live session data) but give each its own
+> `APP_BASE_URL` — `http://localhost:8501` locally, your real deployed URL
+> in production — so each generates QR codes/join links pointing at itself,
+> not the other one.
 
 ---
 
@@ -239,55 +273,72 @@ training session, pick one:
 1. From the join screen, expand **"Are you the trainer?"** → **Trainer /
    Host Login**, or open `?mode=host`.
 2. Log in with `ADMIN_PASSWORD`.
-3. If you haven't already, go to **Admin → Question Bank** to add questions
-   and build a **Question Set**, or run the seed script for a ready-made one.
+3. If you haven't already, go to **Admin → Question Sets** to build a set
+   (add questions to it directly, or bulk-import from Excel — see below), or
+   run the seed script for a ready-made one.
 4. **Create Session**: give it a title, pick a question set, and choose:
-   - **Reveal mode** — *Per question* (classic Kahoot-style: reveal each
-     question right after it closes) or *All at once* (nothing is shown
-     until every question has been answered, then everything is revealed
-     together — exam/survey-style). Pick whichever fits how you want to run
-     the session; both are fully supported end-to-end.
+   - **Pacing** — *Host-paced* (one shared question at a time; you control
+     when voting closes and when the group moves on) or *Self-paced*
+     (everyone works through every question independently, at their own
+     speed, with a **Skip** option — no timer, no host click needed between
+     questions). Self-paced sessions always reveal everything together at
+     the end (there's no single shared question to reveal one at a time).
+   - **Reveal mode** (host-paced only) — *Per question* (classic Kahoot-
+     style: reveal each question right after it closes) or *All at once*
+     (nothing is shown until every question has been answered, then
+     everything is revealed together — exam/survey-style).
    - **Anonymous leaderboard** (optional) — hides real names from other
-     participants on the leaderboard. You (the host) always see real names,
-     and so does the Excel export; only what *other participants* see is
-     anonymized (as "Participant 123"-style labels).
+     participants on the leaderboard. Moot in practice today, since
+     participants no longer see the leaderboard at all (see below) — this
+     flag only affects what would show if that changes later. You (the
+     host) and the Excel export always see real names regardless.
    - **Scoring settings** (optional, collapsed by default) — the default is
      **1 point for a correct answer, 0 for incorrect, no time bonus, no
      negative marking**. Turn on the Kahoot-style "bonus points for faster
-     answers" (up to +50%) or negative marking here if you want them.
+     answers" (up to +50%, based on server-measured response time) or
+     negative marking here if you want them.
 5. You'll land in the **control room**: session code + QR code, live
-   participant count, and a progress bar ("Question X of N") that stays
-   visible through every screen so you always know how much of the session
-   is left. The question and its **options are shown on your screen too**
-   (read-only, correct answer never highlighted while voting is open) so
-   you and participants are looking at the same thing on the projector.
-   Click **START SESSION** once people have joined.
-6. What happens per question depends on the reveal mode you picked:
-   - **Per-question mode**: you're in full manual control. **CLOSE VOTING**
-     when ready → **Reveal** (label adapts to question type) → choose
+   participant count, and a progress bar that stays visible through every
+   screen so you always know how much of the session is left. Click **START
+   SESSION** once people have joined.
+6. What happens next depends on the pacing/reveal mode you picked:
+   - **Host-paced, per-question mode**: full manual control, no timer. The
+     question and its **options are shown on your screen too** (read-only,
+     correct answer never highlighted while voting is open). **CLOSE
+     VOTING** when ready → **Reveal** (label adapts to question type,
+     including a real word-cloud image for word-cloud questions) → choose
      **Bar** or **Pie** chart style → **SHOW LEADERBOARD** → **NEXT
      QUESTION**.
-   - **All-at-once mode**: fully hands-off. Voting closes itself the
-     moment the timer runs out *or* every joined participant has answered
-     (whichever comes first), and the session moves straight to the next
-     question — no clicks needed from you at all until the very end.
-7. Both modes converge on the same **Group Results** screen once the last
-   question is done (automatically for all-at-once, or via **SHOW
-   LEADERBOARD** on the last question for per-question mode) — an
-   anonymous, group-level summary: a donut chart of overall % correct,
-   Participants / Total Questions / Group Accuracy / Average Score tiles,
-   and a per-question breakdown (sortable by question # or incorrect %,
-   Bar/Pie toggle, each question showing "X of N answered correctly (Y%)"
-   plus its explanation). From here:
+   - **Host-paced, all-at-once mode**: hands-off once started. Voting closes
+     itself the moment every joined participant has answered, and the
+     session moves straight to the next question — no clicks needed from
+     you until the very end.
+   - **Self-paced**: a live progress panel shows, per participant, how many
+     of the total questions they've answered/skipped so far. Closes and
+     reveals automatically once everyone's finished every question, or
+     click **Close & Reveal Results** to end it early yourself.
+7. All three paths converge on the same **Group Results** screen once
+   there's nothing left to advance through — an anonymous, group-level
+   summary: a donut chart of overall % correct, Participants / Total
+   Questions / Group Accuracy / Average Score tiles, and a per-question
+   breakdown (sortable by question # or incorrect %, Bar/Pie toggle, word
+   clouds rendered for word-cloud questions, each question showing "X of N
+   answered correctly (Y%)" plus its explanation). **This screen, and the
+   ranked leaderboard, are visible to you only** — participants never see
+   it. From here:
    - **🏆 Show Leaderboard** reveals the ranked leaderboard inline (with
-     real names — this is host-only, never anonymized for you).
-   - **⬇️ Download Results (Excel)** for offline records.
-   - **🌐 Reveal to Participants** pushes this same anonymous group summary
-     to every participant's phone — nothing on this screen is visible to
-     participants until you click this.
+     real names — host-only).
+   - **🔄 Prepare Excel Export** then **⬇️ Download Results (Excel)** for
+     offline records (built on demand when you click Prepare, not
+     continuously in the background).
+   - **🌐 Reveal to Participants** — participants only ever see their *own*
+     personal scorecard (correct/incorrect count and accuracy %, plus their
+     own answer-by-answer review); this button controls when that becomes
+     visible to them, same as before, it just no longer also reveals group
+     charts or the leaderboard to them, since they never see those.
    - **🏁 End Session** wraps up. The same Group Results screen (with the
-     same four controls) is shown again on **Session Ended**, and later
-     for any past session from **Admin → Sessions & Results**.
+     same controls) is shown again on **Session Ended**, and later for any
+     past session from **Admin → Sessions & Results**.
 8. If you refresh the host tab or come back later, log in again and click
    **Resume →** on your in-progress session — nothing is lost, because it's
    all in the database, not the browser tab.
@@ -296,38 +347,43 @@ training session, pick one:
 
 1. Scan the QR code (or open the join URL / enter the 6-digit code manually).
 2. Enter a name, tap **Join Session**.
-3. A progress bar ("Question X of N") is visible at the top throughout, so
-   you always know how many questions are left. Wait for the host to start;
-   when a question goes live it appears automatically (polling, no refresh
-   needed) with a countdown timer (a consistent 30s by default).
+3. A progress bar is visible at the top throughout. Wait for the host to
+   start; when a question (or, in self-paced mode, the whole question set)
+   goes live it appears automatically (polling, no refresh needed) — there
+   is no timer or countdown.
 4. Tap an answer (or type one for word-cloud/open-ended questions). Once
-   submitted, the button disables and shows "Answer submitted".
-   - In *per-question* reveal mode, the correct answer/results appear as
-     soon as the host reveals them.
-   - In *all-at-once* mode, nothing is shown per question — the next
-     question just appears on its own once voting closes.
-5. After the last question, once the host clicks **Reveal to Participants**,
-   you see the same anonymous **Group Results** the host sees, plus a
+   submitted, the button disables and shows "Answer submitted". In
+   self-paced mode there's also a **Skip this question** button, and the
+   next question appears immediately after answering/skipping — no waiting
+   for the host.
+5. **You only ever see your own results — never anyone else's, and never
+   group-level charts or a leaderboard.** In host-paced *per-question* mode,
+   once the host reveals a question you see whether *you* got it right (and
+   the correct answer/explanation for MCQs), not how the whole group
+   answered. In *all-at-once* mode, nothing is shown per question at all.
+6. After the last question, once the host clicks **Reveal to Participants**,
+   you see your personal scorecard: how many you got **✅ Correct**, how many
+   **❌ Incorrect**, your **Accuracy %**, and **⭐ Your Score**, plus a
    **"Your Answers"** section listing every question with a ✅/❌/⬜ badge
    right on the collapsed row — so you can tell at a glance which ones you
-   got wrong without opening each one, and only expand those for detail.
-5. A "Your rank: #N · X pts" line always shows your own real result. If the
-   host enabled anonymous mode for this session, the ranked list below it
-   shows every participant (including you) as an anonymous label like
-   "Participant 123" instead of real names — the pseudonym is stable for
-   the whole session, so you'll recognize your own row across screens even
-   without your name on it.
-6. If your phone drops connection or you refresh, rejoin with the **same
-   name** and you'll reconnect to your existing score rather than starting
-   over or being blocked as a "duplicate name".
+   got wrong without opening each one.
+7. If your phone drops connection or you refresh, rejoin with the **same
+   name** and you'll reconnect to your existing progress/score rather than
+   starting over or being blocked as a "duplicate name".
 
 ### Admin console
 
-`?mode=admin` (or the **Admin** button from the host screen): manage the
-question bank (create/edit/duplicate/delete/search/filter), build and edit
-question sets, bulk-import questions from Excel (with row-level validation
-and a downloadable template), and browse/download results for any past
-session.
+`?mode=admin` (or the **Admin** button from the host screen): **Question
+Sets** is the only workflow — there's no separate "question bank" screen.
+Create a set, then add questions to it directly (a nested "add new question"
+form right inside the set), add an existing question from elsewhere in the
+bank (with search), or bulk-import from Excel straight into that set (with
+row-level validation, a downloadable template, and duplicate detection — a
+question matching an existing one by text + type is flagged and reused
+instead of creating a duplicate row). Every question is worth 1 point by
+default; edit an individual question's points afterward if you want to
+weight a specific question higher. **Sessions & Results** browses/downloads
+results for any past session.
 
 ---
 
@@ -335,16 +391,18 @@ session.
 
 | Type | Notes |
 |---|---|
-| **MCQ** | 2–6 options, one correct answer, explanation, points, optional timer. Scored server-side. **Default: 1 point for a correct answer, 0 for incorrect** — the host can optionally enable a Kahoot-style time bonus (up to +50% scaled by remaining time) and/or negative marking per session (§6). Results can be shown as a bar or pie chart. |
-| **POLL** | 2–8 options (4 built into the form + optional extra options), no correct answer, live percentage bars/pie chart. |
-| **WORD CLOUD** | Free-text, one response per participant. Aggregated with stop-word removal, lower-casing and punctuation stripping (`services/analytics.py`), rendered as an actual word-cloud image sized by frequency. |
-| **RATING** | 1–5 stars, optional min/max labels, shows an average + distribution. |
+| **MCQ** | 2–6 options, one correct answer, explanation, points (default 1). Scored server-side. The host can optionally enable a Kahoot-style time bonus (up to +50%, scaled by server-measured response time against the question's configured `timer_seconds`) and/or negative marking per session (§6) — this is the only place `timer_seconds` still matters; there's no visible countdown in either pacing mode. Results shown to the host as a bar or pie chart. |
+| **POLL** | 2–8 options (4 built into the form + optional extra options), no correct answer, live percentage bars/pie chart (host-only). |
+| **WORD CLOUD** | Free-text, one response per participant. Aggregated with stop-word removal, lower-casing and punctuation stripping (`services/analytics.py`), rendered as an actual word-cloud image sized by frequency, on both the per-question reveal and the Group Results breakdown. |
+| **RATING** | 1–5 stars, optional min/max labels, shows an average + distribution (host-only). |
 | **OPEN ENDED** | Free text, shown to the host as a simple attributed list. |
 
-Every result view above is anonymous by construction — it shows option-level
-counts/percentages, never who picked what. Real names only ever appear on
-the leaderboard (optionally anonymized too, see §6) and in the host's Excel
-export.
+Every group-level result view above (bar/pie charts, word clouds, rating
+distributions, the open-ended list) is host-only and anonymous by
+construction — option-level counts/percentages, never who picked what.
+Participants only see their own answer to each question, never the group
+breakdown. Real names only ever appear on the host's leaderboard view and in
+the Excel export.
 
 Adding a 6th type means: extend the `type` check constraint in
 `database/schema.sql`, add a case to `services/scoring.py::score_response`
@@ -365,40 +423,44 @@ The suite is split by what it needs:
 
 - **Pure unit tests** (`test_scoring.py`, `test_validation.py`,
   `test_excel_import.py`, `test_excel_export.py`, `test_session_manager.py`,
-  `test_qr_code.py`, `test_leaderboard_anonymize.py`) — no database required,
-  always run.
+  `test_qr_code.py`, `test_leaderboard_anonymize.py`,
+  `test_participant_reveal_gate.py`) — no database required, always run.
 - **`test_analytics.py`** — monkeypatches `services.database`'s read
   functions to verify the aggregation *math* (percentages, stop-word
   filtering, rating averages) without a live DB.
 - **`test_integration_db.py`** — end-to-end against a real database (session
   creation, joining, duplicate-name/duplicate-answer rejection, scoring,
-  leaderboard ranking, both reveal-mode paths, the full state-machine walk to
-  `SESSION_ENDED`). These **automatically skip** (not fail) if `DATABASE_URL`
-  isn't set or isn't reachable, so the suite still passes in an environment
-  with no DB configured. Point `DATABASE_URL` at your Supabase project (with
-  `schema.sql` applied) to run them for real; every row they create is
-  cleaned up in fixture teardown.
+  leaderboard ranking, both host-paced reveal-mode paths, self-paced mode
+  including skip/progress/auto-close, Excel-import duplicate handling, the
+  full state-machine walk to `SESSION_ENDED`). These **automatically skip**
+  (not fail) if `DATABASE_URL` isn't set or isn't reachable, so the suite
+  still passes in an environment with no DB configured. Point `DATABASE_URL`
+  at your Supabase project (with `schema.sql` applied) to run them for real;
+  every row they create is cleaned up in fixture teardown.
 
 This project has also been manually tested end-to-end in a browser against a
-live Supabase project: creating sessions in both reveal modes, joining as a
-participant in a second tab, running through all five question types with
-live polling between host and participant screens, timer auto-expiry, the
-per-question and all-at-once leaderboards (anonymized and real-name), bar
-and pie chart results, the LAN-IP QR code actually resolving correctly, and
-Excel export.
+live Supabase project: creating sessions in both pacing models and both
+reveal modes, joining as a participant in a second tab, running through all
+five question types with live polling between host and participant screens,
+the per-question and all-at-once flows, self-paced answering with skip,
+the admin question-set/import workflow, bar and pie chart results, word
+clouds, the LAN-IP QR code actually resolving correctly, and Excel export —
+plus a live deployment on Render (see §10).
 
 ---
 
 ## 9. Design notes / known limitations
 
 - **Polling, not WebSockets.** `st.fragment(run_every=...)` re-reads the DB
-  every couple of seconds. This is simple, has no extra moving parts, and is
-  fast enough for a classroom (host and participant screens visibly update
-  within ~2s in testing). If you outgrow it, the database layer is already
-  the single source of truth, so the natural upgrade path is to add
-  Supabase Realtime (Postgres logical replication → websocket) purely as a
-  *notification* that triggers an immediate re-read, without touching the
-  data model.
+  every couple of seconds. Host and participant screens are each split into
+  a small polling fragment (does the minimum read + a "did anything change"
+  check) and a plain rendering function that only re-runs on a real
+  transition — this is what keeps the question/answer UI from flickering or
+  greying out on every tick. If you outgrow polling entirely, the database
+  layer is already the single source of truth, so the natural upgrade path
+  is to add Supabase Realtime (Postgres logical replication → websocket)
+  purely as a *notification* that triggers an immediate re-read, without
+  touching the data model.
 - **Auth is a single shared password**, not per-host accounts — appropriate
   for one trainer running their own sessions. The `users` table exists in
   the schema so real per-host accounts can be layered in later without a
@@ -412,43 +474,51 @@ Excel export.
   bypassed** (`st.navigation([...], position="hidden")` in `app.py`) so that
   participants never see host/admin links in a sidebar — the folder is
   still named `pages/` for code organization, but routing is done explicitly
-  by `app.py` based on URL query params / in-app buttons.
+  by `app.py` based on URL query params / in-app buttons. Once a role is set
+  in `session_state` it takes priority over the URL on every subsequent
+  rerun (a `?mode=host` link that stays in the address bar can't silently
+  override switching to Admin, for example).
 - **Excel export strips timezones.** Postgres always returns timezone-aware
   timestamps; openpyxl can't write those, so `utils/excel_export.py`
-  normalizes them to naive UTC before writing.
-- **DEFERRED reveal mode reuses the same state machine**, not a parallel
-  one — it just takes an extra edge (`VOTING_CLOSED → QUESTION_ACTIVE`
-  directly, skipping `RESULTS_REVEALED`/`LEADERBOARD` per question) that
-  `INSTANT` mode never uses, plus one new terminal action
-  (`reveal_all_and_show_leaderboard`) that marks every question revealed at
-  once. See the docstring at the top of `services/session_manager.py`.
-- **DEFERRED auto-advance is a poll-loop side effect, not a background
-  job.** `services/session_manager.py::auto_advance_deferred` is called on
-  every host-side fragment tick (`pages/host.py::_render_control_room`); it
-  closes voting once the timer expires or every joined participant has
-  answered, then immediately chains into `next_question`/
-  `reveal_all_and_show_leaderboard` within the same call. There's no
-  separate scheduler — if the host's browser tab isn't open, nothing
-  advances, same as every other state transition in this app.
-- **Both reveal modes converge on one "Group Results" screen**
-  (`components/session_report.py` + `pages/host.py::_render_group_summary_screen`)
-  once there's no next question — `_render_leaderboard` and
-  `_render_session_ended` both route into it rather than each having their
-  own final-state UI, so the two modes can't drift out of sync with each
-  other.
+  normalizes them to naive UTC before writing. It's also built **on demand**
+  (a "Prepare Excel Export" click), not regenerated on every poll tick —
+  earlier versions did the latter and it was a major source of unnecessary
+  database load on the host's screen.
+- **Self-paced mode has no single shared "current question".** Each
+  participant's own responses (answered or skipped, both are rows in
+  `responses` — `is_skipped` distinguishes them) determine which question
+  they see next, computed client-side from a full question list fetched
+  once per session (it's immutable once a session starts) and their own
+  response list. The host's live progress panel and the auto-close check
+  both come from one aggregate query (`services/database.py::get_self_paced_progress`).
+- **Both host-paced reveal modes, and self-paced, converge on one "Group
+  Results" screen** (`components/session_report.py` +
+  `pages/host.py::_render_group_summary_screen`) once there's no next
+  question — every path routes into it rather than each having its own
+  final-state UI, so they can't drift out of sync with each other. This
+  screen (and the ranked leaderboard) is host-only.
 - **"Reveal to Participants" is a flag, not a status transition.**
   `sessions.group_summary_revealed_at` is set independently of
   `sessions.status` (which stays `LEADERBOARD`), so it doesn't touch
   `VALID_TRANSITIONS` at all — see `services/database.py::reveal_group_summary`.
-- **Anonymization happens at render time, not query time.** The database
-  and the `session_leaderboard` view always return real names; only the
-  participant-facing call to `components/leaderboard.py::render_leaderboard`
-  passes `anonymize=True`. The host's view and the Excel export always call
-  it with `anonymize=False`, so the trainer never loses visibility into who
-  is who even when participants can't see each other's names. The Group
-  Results screen is anonymous by construction for a different reason: it's
-  built entirely from option-level counts/percentages (`services/analytics.py`),
-  which never carry a participant identity in the first place.
+  `pages/participant.py::_final_results_revealed` is the single gate both
+  pacing modes check before showing anything on the final screen.
+- **Participants see personal results only, by design.** Every group-level
+  aggregate (option breakdown bar/pie charts, rating distribution, word
+  clouds, the ranked leaderboard) is rendered only from `pages/host.py` and
+  `components/session_report.py`; `pages/participant.py` never calls into
+  those — it computes a participant's own correct/incorrect/accuracy
+  directly from their own rows in `responses`
+  (`services/database.py::list_responses_for_participant`).
+- **A temporary diagnostic layer exists** (`services/diagnostics.py`) for
+  investigating live-polling performance — it prints per-query timing
+  (pool-wait vs. SQL-execution time, new-connection detection) and a
+  per-poll summary line (`HOST_POLL total=...ms db=...ms queries=N` /
+  `PARTICIPANT_POLL ...`) to stdout, visible in your hosting platform's logs.
+  It adds negligible overhead and is safe to leave in place; strip the
+  `diagnostics.start_poll`/`mark`/`end_poll` calls from `pages/host.py`,
+  `pages/participant.py` and `services/session_manager.py` (and delete the
+  module) if you want it gone later.
 
 ---
 
@@ -460,17 +530,21 @@ the right environment variables works. Since all shared state is in
 Supabase, you can even run multiple instances behind a load balancer with no
 session-affinity requirement.
 
-**See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full walkthrough**, covering
-two paths:
+**This project is currently deployed on [Render](https://render.com)** (free
+tier, Singapore region) — see [`render.yaml`](render.yaml) for the exact
+service definition. **See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full
+walkthrough**, covering two paths:
 - An instant, temporary internet URL via **ngrok** (no deployment, ready in
   minutes — for a session happening today).
-- A **permanent deployment on your own custom domain** via GitHub + Render
-  (with a `render.yaml` blueprint already included in this repo), plus the
-  DNS setup and the important warning about using a *subdomain* so you don't
-  accidentally point your main website's domain at this app instead.
+- A **permanent deployment on your own custom domain** via GitHub + Render,
+  plus the DNS setup and the important warning about using a *subdomain* so
+  you don't accidentally point your main website's domain at this app
+  instead.
 
-(Streamlit Community Cloud is intentionally not used here — it doesn't
-support custom domains, which the deployment guide treats as a requirement.)
+(Streamlit Community Cloud is intentionally not used for the custom-domain
+path — it doesn't support custom domains. It's a perfectly good option if
+you don't need one, though: free, no card required, connects straight to
+GitHub.)
 
 ---
 
