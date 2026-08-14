@@ -123,10 +123,29 @@ def _render_question_sets_tab() -> None:
                 st.caption("No other existing questions to add.")
 
             st.divider()
-            if st.button("🗑️ Delete Set", key=f"del_set_{qs['id']}", use_container_width=True):
-                db.delete_question_set(qs["id"])
-                st.success("Deleted.")
-                st.rerun()
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                if st.button("🗑️ Delete Set Only", key=f"del_set_{qs['id']}", use_container_width=True,
+                              help="Removes this set. Its questions stay in your question bank, "
+                                   "available to add to another set."):
+                    db.delete_question_set(qs["id"])
+                    st.success("Set deleted. Its questions are still in your question bank.")
+                    st.rerun()
+            with dc2:
+                if st.button("🗑️ Delete Set + Its Questions", key=f"del_set_full_{qs['id']}",
+                              use_container_width=True,
+                              help="Deletes the set AND every question in it (unless a question was "
+                                   "used in a past session, which keeps it in the bank for that "
+                                   "session's historical record)."):
+                    result = db.delete_question_set_and_questions(qs["id"])
+                    msg = f"Set deleted along with {result['deleted_questions']} question(s)."
+                    if result["kept_questions"]:
+                        msg += (
+                            f" {result['kept_questions']} question(s) were used in a past session "
+                            f"and kept in your question bank instead of being deleted."
+                        )
+                    st.success(msg)
+                    st.rerun()
 
 
 def _render_add_question_form(target_set_id: str) -> None:
@@ -316,10 +335,19 @@ def _render_question_editor(q: dict, set_id: str, set_items: list[dict]) -> None
     elif delete:
         # Deletes the question everywhere (cascades out of every set
         # it's in, not just this one) -- distinct from "remove from
-        # this set only" below.
-        db.delete_question(q["id"])
-        st.success("Deleted.")
-        st.rerun()
+        # this set only" below. A question already used in a past
+        # session can't be deleted (its historical results/responses
+        # depend on it) -- delete_question_safe reports that instead
+        # of raising and crashing the page.
+        if db.delete_question_safe(q["id"]):
+            st.success("Deleted.")
+            st.rerun()
+        else:
+            st.error(
+                "Can't delete this question -- it was used in a past session, and deleting it "
+                "would break that session's historical results. Use 'Remove from this set only' "
+                "below instead if you just want it out of this set."
+            )
 
     if st.button("➖ Remove from this set only (keeps the question)",
                   key=f"rm_{set_id}_{q['id']}", use_container_width=True):

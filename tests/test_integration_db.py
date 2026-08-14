@@ -568,3 +568,60 @@ def test_import_reuses_existing_question_instead_of_duplicating(empty_set):
     finally:
         for q in db.list_questions(search="__import_test__"):
             db.delete_question(q["id"])
+
+
+# ---------------------------------------------------------------
+# Deleting a question that's already used in a past session: this
+# used to raise sqlalchemy.exc.IntegrityError straight into the admin
+# UI (FK violation on session_questions.question_id, which is
+# deliberately ON DELETE RESTRICT to protect historical session
+# data). delete_question_safe/delete_question_set_and_questions
+# report it instead of crashing.
+# ---------------------------------------------------------------
+def test_delete_question_safe_keeps_a_question_used_in_a_past_session(sample_session):
+    session, questions = sample_session
+    used_question_id = questions[0]["id"]  # session_questions references this via sample_session
+
+    result = db.delete_question_safe(used_question_id)
+    assert result is False
+    assert db.get_question(used_question_id) is not None  # still there, not deleted
+
+
+def test_delete_question_safe_deletes_an_unused_question():
+    q = db.create_question(
+        question="__delete_test__ never used in a session", type="MCQ",
+        option_a="A", option_b="B", correct_answer="A", points=1, timer_seconds=30,
+        category="General", difficulty="Easy",
+    )
+    result = db.delete_question_safe(q["id"])
+    assert result is True
+    assert db.get_question(q["id"]) is None
+
+
+def test_delete_question_set_and_questions_keeps_used_deletes_unused(sample_set):
+    qs, questions = sample_set  # sample_set's questions are NOT yet used in any session
+
+    result = db.delete_question_set_and_questions(qs["id"])
+    assert result == {"deleted_questions": 2, "kept_questions": 0}
+    assert db.get_question_set(qs["id"]) is None
+    for q in questions:
+        assert db.get_question(q["id"]) is None
+
+
+def test_delete_question_set_and_questions_keeps_questions_used_by_a_session(sample_session):
+    # sample_session depends on sample_set internally (same qs/questions
+    # instance, pytest caches fixtures per test), so this is exactly
+    # "delete the set a real session already used" -- its
+    # session_questions rows are what makes the questions undeletable.
+    session, questions = sample_session
+    qs_id = session["question_set_id"]
+
+    result = db.delete_question_set_and_questions(qs_id)
+    assert result == {"deleted_questions": 0, "kept_questions": 2}
+    assert db.get_question_set(qs_id) is None  # the set itself is still deleted
+    for q in questions:
+        assert db.get_question(q["id"]) is not None  # but the questions are kept
+
+    # sample_session's teardown deletes the session next (cascading
+    # session_questions), then sample_set's teardown can clean up the
+    # now-unreferenced questions -- no manual cleanup needed here.

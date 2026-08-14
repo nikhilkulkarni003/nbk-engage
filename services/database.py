@@ -234,6 +234,28 @@ def delete_question_set(question_set_id: str) -> None:
     execute("delete from question_sets where id = :id", {"id": question_set_id})
 
 
+def delete_question_set_and_questions(question_set_id: str) -> dict:
+    """Deletes the set AND attempts to delete every question that was
+    in it -- not just the set/its links (which is all delete_question_set
+    does). A question also used in a past session is kept in the bank
+    (see delete_question_safe) rather than force-deleted; everything
+    else is removed. A question that's ALSO in another set gets
+    removed from that set too (questions.id cascades into
+    question_set_items), which is expected for "delete this set and
+    its questions", not just "delete this set"."""
+    items = get_question_set_items(question_set_id)
+    delete_question_set(question_set_id)
+
+    deleted = 0
+    kept = 0
+    for item in items:
+        if delete_question_safe(item["id"]):
+            deleted += 1
+        else:
+            kept += 1
+    return {"deleted_questions": deleted, "kept_questions": kept}
+
+
 def set_question_set_items(question_set_id: str, question_ids: list[str]) -> None:
     """Replaces the full ordered list of questions in a set."""
     with get_conn() as conn:
@@ -306,6 +328,20 @@ def update_question(question_id: str, **fields) -> dict:
 
 def delete_question(question_id: str) -> None:
     execute("delete from questions where id = :id", {"id": question_id})
+
+
+def delete_question_safe(question_id: str) -> bool:
+    """Same as delete_question, but returns False instead of raising
+    when the question can't be deleted because it's referenced by a
+    past session's session_questions row (question_id there is
+    ON DELETE RESTRICT, deliberately, so a real session's historical
+    results/responses are never silently orphaned). Callers should
+    tell the user it was kept, not crash the page."""
+    try:
+        delete_question(question_id)
+        return True
+    except IntegrityError:
+        return False
 
 
 def duplicate_question(question_id: str) -> dict:
