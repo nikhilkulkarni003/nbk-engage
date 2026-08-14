@@ -341,19 +341,45 @@ def list_questions(search: str = "", category: Optional[str] = None,
     return fetch_all(f"select * from questions {where} order by created_at desc", params)
 
 
-def bulk_insert_questions(rows: list[dict]) -> int:
-    inserted = 0
-    with get_conn() as conn:
-        for row in rows:
-            cols = [f for f in QUESTION_FIELDS if f in row]
-            placeholders = ", ".join(f":{c}" for c in cols)
-            col_list = ", ".join(cols)
-            conn.execute(
-                text(f"insert into questions ({col_list}) values ({placeholders})"),
-                _question_params(row, cols),
-            )
-            inserted += 1
-    return inserted
+def import_questions_into_set(rows: list[dict], question_set_id: str) -> dict:
+    """Excel import target: adds every row to `question_set_id`
+    directly (no separate "question bank" step). A row whose question
+    text + type already matches an existing question (case-
+    insensitive) is NOT re-inserted as a duplicate -- the existing
+    question is reused/linked into the set instead. Appends to
+    whatever is already in the set rather than replacing it. Returns
+    {"new_count", "duplicate_count", "total"} for the UI to report."""
+    existing = {
+        (row["question"].strip().lower(), row["type"]): row["id"]
+        for row in fetch_all("select id, question, type from questions")
+    }
+
+    result_ids: list[str] = []
+    new_count = 0
+    duplicate_count = 0
+    for row in rows:
+        key = (row["question"].strip().lower(), row["type"])
+        existing_id = existing.get(key)
+        if existing_id:
+            duplicate_count += 1
+            result_ids.append(existing_id)
+            continue
+        cols = [f for f in QUESTION_FIELDS if f in row]
+        placeholders = ", ".join(f":{c}" for c in cols)
+        col_list = ", ".join(cols)
+        created = fetch_one(
+            f"insert into questions ({col_list}) values ({placeholders}) returning *",
+            _question_params(row, cols),
+        )
+        existing[key] = created["id"]
+        result_ids.append(created["id"])
+        new_count += 1
+
+    current_ids = [it["id"] for it in get_question_set_items(question_set_id)]
+    combined = current_ids + [qid for qid in result_ids if qid not in current_ids]
+    set_question_set_items(question_set_id, combined)
+
+    return {"new_count": new_count, "duplicate_count": duplicate_count, "total": len(rows)}
 
 
 def list_categories() -> list[str]:

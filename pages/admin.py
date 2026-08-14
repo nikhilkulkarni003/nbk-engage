@@ -1,6 +1,9 @@
 """
-Admin console: manage the question bank, build question sets,
-import questions from Excel, and browse/download past sessions.
+Admin console: build/manage question sets (adding, editing and
+importing questions all happen nested inside a set -- there is
+deliberately no separate standalone "question bank" screen, see
+services/database.py::import_questions_into_set), and browse/download
+past sessions.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ SUGGESTED_CATEGORIES = [
 
 
 def render(on_switch_role) -> None:
-    if not auth.render_login_gate("Enter the trainer password to manage the question bank."):
+    if not auth.render_login_gate("Enter the trainer password to manage question sets."):
         return
 
     ok, msg = db.check_connection()
@@ -40,11 +43,9 @@ def render(on_switch_role) -> None:
             auth.log_out()
             on_switch_role("participant")
 
-    tab_bank, tab_sets, tab_import, tab_sessions = st.tabs(
-        ["📖 Question Bank", "🗂️ Question Sets", "📤 Excel Import", "📊 Sessions & Results"]
+    tab_sets, tab_import, tab_sessions = st.tabs(
+        ["🗂️ Question Sets", "📤 Excel Import", "📊 Sessions & Results"]
     )
-    with tab_bank:
-        _render_question_bank_tab()
     with tab_sets:
         _render_question_sets_tab()
     with tab_import:
@@ -54,49 +55,98 @@ def render(on_switch_role) -> None:
 
 
 # ---------------------------------------------------------------
-# Question bank
+# Question sets -- the one place questions get created, edited,
+# imported into, or removed. No separate question-bank screen.
 # ---------------------------------------------------------------
-def _render_question_bank_tab() -> None:
-    with st.expander("➕ Add New Question", expanded=False):
-        _render_add_question_form()
+def _render_question_sets_tab() -> None:
+    st.markdown("#### Create a Question Set")
+    with st.form("create_set_form"):
+        title = st.text_input("Set Title", placeholder="e.g. Session 1 - Financial Statements Basics")
+        description = st.text_input("Description (optional)")
+        category = st.text_input("Category", value="General")
+        submitted = st.form_submit_button("➕ Create Empty Set", use_container_width=True)
+    if submitted:
+        if not title.strip():
+            st.error("Please enter a title.")
+        else:
+            db.create_question_set(title.strip(), description, category.strip() or "General")
+            st.success(f"Created '{title}'. Add questions to it below.")
+            st.rerun()
 
-    st.markdown("#### Search & Filter")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        search = st.text_input("Search", placeholder="Search question text...")
-    with c2:
-        categories = ["All"] + sorted(set(SUGGESTED_CATEGORIES) | set(db.list_categories()))
-        category = st.selectbox("Category", categories)
-    with c3:
-        difficulty = st.selectbox("Difficulty", ["All"] + ALLOWED_DIFFICULTIES)
-    with c4:
-        q_type = st.selectbox("Type", ["All"] + ALLOWED_TYPES)
+    st.divider()
+    st.markdown("#### Your Question Sets")
+    sets = db.list_question_sets()
+    if not sets:
+        st.info("No question sets yet. Create one above.")
+        return
 
-    questions = db.list_questions(search=search, category=category, difficulty=difficulty, q_type=q_type)
-    st.caption(f"{len(questions)} question(s)")
+    all_questions = db.list_questions()
 
-    for q in questions:
-        title = f"[{q['type']}] {q['question'][:70]}"
-        with st.expander(title):
-            _render_question_editor(q)
+    for qs in sets:
+        with st.expander(f"{qs['title']} ({qs['question_count']} questions)"):
+            items = db.get_question_set_items(qs["id"])
+
+            if items:
+                st.markdown("**Questions in this set** (in order)")
+                for it in items:
+                    with st.expander(f"[{it['type']}] {it['question'][:70]}", expanded=False):
+                        _render_question_editor(it, qs["id"], items)
+            else:
+                st.caption("No questions in this set yet -- add one below.")
+
+            st.markdown("**➕ Add a new question to this set**")
+            _render_add_question_form(qs["id"])
+
+            st.markdown("**Add an existing question from another set**")
+            item_ids = {it["id"] for it in items}
+            other_questions = [q for q in all_questions if q["id"] not in item_ids]
+            if other_questions:
+                search = st.text_input(
+                    "Search", key=f"search_existing_{qs['id']}",
+                    placeholder="Filter by question text...", label_visibility="collapsed",
+                )
+                if search.strip():
+                    other_questions = [
+                        q for q in other_questions if search.strip().lower() in q["question"].lower()
+                    ]
+                other_options = {f"[{q['type']}] {q['question'][:60]}": q["id"] for q in other_questions}
+                chosen = st.multiselect(
+                    "Pick existing question(s) to add", options=list(other_options.keys()),
+                    key=f"add_existing_{qs['id']}", label_visibility="collapsed",
+                )
+                if chosen and st.button("Add Selected", key=f"add_existing_btn_{qs['id']}"):
+                    combined = [it["id"] for it in items] + [other_options[c] for c in chosen]
+                    db.set_question_set_items(qs["id"], combined)
+                    st.success(f"Added {len(chosen)} question(s).")
+                    st.rerun()
+            else:
+                st.caption("No other existing questions to add.")
+
+            st.divider()
+            if st.button("🗑️ Delete Set", key=f"del_set_{qs['id']}", use_container_width=True):
+                db.delete_question_set(qs["id"])
+                st.success("Deleted.")
+                st.rerun()
 
 
-def _render_add_question_form() -> None:
-    q_type = st.selectbox("Question Type", ALLOWED_TYPES, key="admin_new_q_type")
+def _render_add_question_form(target_set_id: str) -> None:
+    q_type = st.selectbox("Question Type", ALLOWED_TYPES, key=f"new_q_type_{target_set_id}")
 
-    with st.form("add_question_form", clear_on_submit=True):
-        question_text = st.text_area("Question")
+    with st.form(f"add_question_form_{target_set_id}", clear_on_submit=True):
+        question_text = st.text_area("Question", key=f"new_q_text_{target_set_id}")
         cat_col, diff_col = st.columns(2)
         with cat_col:
             category = st.text_input("Category", value="General",
-                                      help=f"Suggestions: {', '.join(SUGGESTED_CATEGORIES)}")
+                                      help=f"Suggestions: {', '.join(SUGGESTED_CATEGORIES)}",
+                                      key=f"new_q_cat_{target_set_id}")
         with diff_col:
-            difficulty = st.selectbox("Difficulty", ALLOWED_DIFFICULTIES, index=1)
+            difficulty = st.selectbox("Difficulty", ALLOWED_DIFFICULTIES, index=1,
+                                       key=f"new_q_diff_{target_set_id}")
 
         option_a = option_b = option_c = option_d = ""
         correct_answer = ""
         explanation = ""
-        points = 0
+        points = 1
         timer_seconds = 30
         min_label = max_label = ""
         min_response_length = 2
@@ -105,38 +155,48 @@ def _render_add_question_form() -> None:
         if q_type in ("MCQ", "POLL"):
             oc1, oc2 = st.columns(2)
             with oc1:
-                option_a = st.text_input("Option A")
-                option_c = st.text_input("Option C (optional)")
+                option_a = st.text_input("Option A", key=f"new_q_a_{target_set_id}")
+                option_c = st.text_input("Option C (optional)", key=f"new_q_c_{target_set_id}")
             with oc2:
-                option_b = st.text_input("Option B")
-                option_d = st.text_input("Option D (optional)")
+                option_b = st.text_input("Option B", key=f"new_q_b_{target_set_id}")
+                option_d = st.text_input("Option D (optional)", key=f"new_q_d_{target_set_id}")
             if q_type == "POLL":
                 extra_options_raw = st.text_area(
-                    "Additional options (optional, one per line, for a poll with more than 4 choices)"
+                    "Additional options (optional, one per line, for a poll with more than 4 choices)",
+                    key=f"new_q_extra_{target_set_id}",
                 )
 
         if q_type == "MCQ":
-            correct_answer = st.selectbox("Correct Answer", ["A", "B", "C", "D"])
-            explanation = st.text_area("Explanation (shown after reveal)")
-            points = st.number_input("Points for a correct answer", min_value=0, value=1, step=1)
+            correct_answer = st.selectbox("Correct Answer", ["A", "B", "C", "D"],
+                                           key=f"new_q_correct_{target_set_id}")
+            explanation = st.text_area("Explanation (shown after reveal)",
+                                        key=f"new_q_expl_{target_set_id}")
+            points = st.number_input("Points for a correct answer", min_value=0, value=1, step=1,
+                                      key=f"new_q_points_{target_set_id}")
 
         if q_type in ("MCQ", "POLL", "WORDCLOUD", "RATING", "OPEN_ENDED"):
-            timer_seconds = st.number_input("Timer (seconds, 0 = no limit)", min_value=0, value=30, step=5)
+            timer_seconds = st.number_input(
+                "Timer (seconds, 0 = no limit) -- only used if you enable the optional "
+                "time-bonus scoring for this question", min_value=0, value=30, step=5,
+                key=f"new_q_timer_{target_set_id}",
+            )
 
         if q_type == "RATING":
             rc1, rc2 = st.columns(2)
             with rc1:
-                min_label = st.text_input("Label for 1 (optional)", placeholder="Poor")
+                min_label = st.text_input("Label for 1 (optional)", placeholder="Poor",
+                                           key=f"new_q_minlabel_{target_set_id}")
             with rc2:
-                max_label = st.text_input("Label for 5 (optional)", placeholder="Excellent")
+                max_label = st.text_input("Label for 5 (optional)", placeholder="Excellent",
+                                           key=f"new_q_maxlabel_{target_set_id}")
 
         if q_type == "WORDCLOUD":
             min_response_length = st.number_input("Minimum word length to include", min_value=1,
-                                                    value=2, step=1)
+                                                    value=2, step=1, key=f"new_q_minlen_{target_set_id}")
 
-        image_url = st.text_input("Image URL (optional)")
+        image_url = st.text_input("Image URL (optional)", key=f"new_q_img_{target_set_id}")
 
-        submitted = st.form_submit_button("➕ Add Question", use_container_width=True)
+        submitted = st.form_submit_button("➕ Add to This Set", use_container_width=True)
 
     if not submitted:
         return
@@ -162,7 +222,7 @@ def _render_add_question_form() -> None:
     elif q_type == "POLL" and extra_options_raw.strip():
         config = {"extra_options": [l.strip() for l in extra_options_raw.splitlines() if l.strip()][:4]}
 
-    db.create_question(
+    created = db.create_question(
         question=question_text.strip(), type=q_type,
         option_a=option_a or None, option_b=option_b or None,
         option_c=option_c or None, option_d=option_d or None,
@@ -172,12 +232,14 @@ def _render_add_question_form() -> None:
         category=category.strip() or "General", difficulty=difficulty,
         image_url=image_url or None, config=config,
     )
-    st.success("Question added.")
+    current_ids = [it["id"] for it in db.get_question_set_items(target_set_id)]
+    db.set_question_set_items(target_set_id, current_ids + [created["id"]])
+    st.success("Question added to this set.")
     st.rerun()
 
 
-def _render_question_editor(q: dict) -> None:
-    with st.form(f"edit_q_{q['id']}"):
+def _render_question_editor(q: dict, set_id: str, set_items: list[dict]) -> None:
+    with st.form(f"edit_q_{set_id}_{q['id']}"):
         question_text = st.text_area("Question", value=q["question"])
         cat_col, diff_col = st.columns(2)
         with cat_col:
@@ -211,15 +273,18 @@ def _render_question_editor(q: dict) -> None:
             points = st.number_input("Points for a correct answer", min_value=0, value=int(points), step=1)
 
         if q["type"] in ("MCQ", "POLL", "WORDCLOUD", "RATING", "OPEN_ENDED"):
-            timer_seconds = st.number_input("Timer (seconds, 0 = no limit)", min_value=0,
-                                             value=int(timer_seconds), step=5)
+            timer_seconds = st.number_input(
+                "Timer (seconds, 0 = no limit) -- only used if you enable the optional "
+                "time-bonus scoring for this question", min_value=0,
+                value=int(timer_seconds), step=5,
+            )
 
         image_url = st.text_input("Image URL (optional)", value=q.get("image_url") or "")
 
         b1, b2, b3 = st.columns(3)
         save = b1.form_submit_button("💾 Save Changes", use_container_width=True)
         duplicate = b2.form_submit_button("📄 Duplicate", use_container_width=True)
-        delete = b3.form_submit_button("🗑️ Delete", use_container_width=True)
+        delete = b3.form_submit_button("🗑️ Delete Everywhere", use_container_width=True)
 
     if save:
         row = {
@@ -246,80 +311,58 @@ def _render_question_editor(q: dict) -> None:
         st.rerun()
     elif duplicate:
         db.duplicate_question(q["id"])
-        st.success("Duplicated.")
+        st.success("Duplicated -- use 'Add an existing question' below to add the copy to a set.")
         st.rerun()
     elif delete:
+        # Deletes the question everywhere (cascades out of every set
+        # it's in, not just this one) -- distinct from "remove from
+        # this set only" below.
         db.delete_question(q["id"])
         st.success("Deleted.")
         st.rerun()
 
-
-# ---------------------------------------------------------------
-# Question sets
-# ---------------------------------------------------------------
-def _render_question_sets_tab() -> None:
-    st.markdown("#### Create a Question Set")
-    all_questions = db.list_questions()
-    if not all_questions:
-        st.info("Add some questions to the bank first.")
-    else:
-        options = {f"[{q['type']}] {q['question'][:60]}": q["id"] for q in all_questions}
-        with st.form("create_set_form"):
-            title = st.text_input("Set Title", placeholder="e.g. Session 1 - Financial Statements Basics")
-            description = st.text_input("Description (optional)")
-            category = st.text_input("Category", value="General")
-            chosen = st.multiselect("Questions (in order)", options=list(options.keys()))
-            submitted = st.form_submit_button("Create Set", use_container_width=True)
-        if submitted:
-            if not title.strip():
-                st.error("Please enter a title.")
-            elif not chosen:
-                st.error("Please select at least one question.")
-            else:
-                qs = db.create_question_set(title.strip(), description, category.strip() or "General")
-                db.set_question_set_items(qs["id"], [options[c] for c in chosen])
-                st.success(f"Created question set '{title}' with {len(chosen)} question(s).")
-                st.rerun()
-
-    st.divider()
-    st.markdown("#### Existing Question Sets")
-    all_questions = db.list_questions()
-    options = {f"[{q['type']}] {q['question'][:60]}": q["id"] for q in all_questions}
-    for qs in db.list_question_sets():
-        with st.expander(f"{qs['title']} ({qs['question_count']} questions)"):
-            items = db.get_question_set_items(qs["id"])
-            for it in items:
-                st.write(f"- [{it['type']}] {it['question']}")
-            current_ids = {it["id"] for it in items}
-            current_labels = [label for label, qid in options.items() if qid in current_ids]
-            new_selection = st.multiselect(
-                "Edit questions in this set", options=list(options.keys()),
-                default=current_labels, key=f"edit_set_{qs['id']}",
-            )
-            e1, e2 = st.columns(2)
-            with e1:
-                if st.button("💾 Save Changes", key=f"save_set_{qs['id']}", use_container_width=True):
-                    db.set_question_set_items(qs["id"], [options[c] for c in new_selection])
-                    st.success("Updated.")
-                    st.rerun()
-            with e2:
-                if st.button("🗑️ Delete Set", key=f"del_set_{qs['id']}", use_container_width=True):
-                    db.delete_question_set(qs["id"])
-                    st.success("Deleted.")
-                    st.rerun()
+    if st.button("➖ Remove from this set only (keeps the question)",
+                  key=f"rm_{set_id}_{q['id']}", use_container_width=True):
+        remaining = [it["id"] for it in set_items if it["id"] != q["id"]]
+        db.set_question_set_items(set_id, remaining)
+        st.success("Removed from this set.")
+        st.rerun()
 
 
 # ---------------------------------------------------------------
-# Excel import
+# Excel import -- imports straight into a chosen (or new) question
+# set, no separate question-bank step. Duplicate questions (same text
+# + type, case-insensitive) are flagged and reused instead of
+# re-inserted. Every imported question is worth 1 point -- not an
+# importable/editable column.
 # ---------------------------------------------------------------
 def _render_import_tab() -> None:
     st.markdown("#### Bulk Import Questions from Excel")
+    st.caption("Every imported question is worth 1 point by default (not editable via import).")
     st.download_button(
         "⬇️ Download Excel Template",
         data=generate_template_bytes(),
         file_name="nbk_engage_question_template.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    st.markdown("#### Import Into")
+    sets = db.list_question_sets()
+    set_options = {qs["title"]: qs["id"] for qs in sets}
+    target_choice = st.radio(
+        "Target", options=["Add to an existing set", "Create a new set"],
+        horizontal=True, label_visibility="collapsed",
+    )
+    target_set_id = None
+    new_set_title = ""
+    if target_choice == "Add to an existing set":
+        if not set_options:
+            st.info("No question sets yet -- choose 'Create a new set' instead.")
+        else:
+            chosen_label = st.selectbox("Question Set", options=list(set_options.keys()))
+            target_set_id = set_options[chosen_label]
+    else:
+        new_set_title = st.text_input("New Set Title", placeholder="e.g. Session 2 - Working Capital")
 
     uploaded = st.file_uploader("Upload .xlsx file", type=["xlsx"])
     if not uploaded:
@@ -336,18 +379,49 @@ def _render_import_tab() -> None:
         for e in errors:
             st.write(f"- {e}")
 
-    if valid_rows:
-        st.success(f"{len(valid_rows)} row(s) passed validation and are ready to import.")
-        st.dataframe(
-            [{"Question": r["question"][:60], "Type": r["type"], "Category": r["category"]} for r in valid_rows],
-            hide_index=True, use_container_width=True,
+    if not valid_rows:
+        if not errors:
+            st.warning("No valid rows found in the file.")
+        return
+
+    existing_keys = {(q["question"].strip().lower(), q["type"]) for q in db.list_questions()}
+    seen_in_file: set[tuple[str, str]] = set()
+    preview = []
+    duplicate_preview_count = 0
+    for r in valid_rows:
+        key = (r["question"].strip().lower(), r["type"])
+        is_dup = key in existing_keys or key in seen_in_file
+        seen_in_file.add(key)
+        if is_dup:
+            duplicate_preview_count += 1
+        preview.append({
+            "Question": r["question"][:60], "Type": r["type"], "Category": r["category"],
+            "Status": "🔁 Duplicate (will reuse existing)" if is_dup else "🆕 New",
+        })
+
+    st.success(f"{len(valid_rows)} row(s) passed validation and are ready to import.")
+    if duplicate_preview_count:
+        st.warning(
+            f"{duplicate_preview_count} row(s) match a question that already exists (by text + type) -- "
+            f"these will be flagged and linked into the set instead of creating duplicate questions."
         )
-        if st.button(f"📥 Import {len(valid_rows)} Question(s)", type="primary", use_container_width=True):
-            count = db.bulk_insert_questions(valid_rows)
-            st.success(f"Imported {count} question(s) into the bank.")
-            st.rerun()
-    elif not errors:
-        st.warning("No valid rows found in the file.")
+    st.dataframe(preview, hide_index=True, use_container_width=True)
+
+    ready = bool(target_set_id) or (target_choice == "Create a new set" and new_set_title.strip())
+    if st.button(f"📥 Import {len(valid_rows)} Question(s)", type="primary",
+                 use_container_width=True, disabled=not ready):
+        if target_choice == "Create a new set":
+            qs = db.create_question_set(new_set_title.strip(), "", "General")
+            target_set_id = qs["id"]
+        result = db.import_questions_into_set(valid_rows, target_set_id)
+        msg = f"Imported {result['new_count']} new question(s) into the set."
+        if result["duplicate_count"]:
+            msg += (
+                f" {result['duplicate_count']} row(s) already existed and were flagged as "
+                f"duplicates -- the existing question was reused instead of re-added."
+            )
+        st.success(msg)
+        st.rerun()
 
 
 # ---------------------------------------------------------------

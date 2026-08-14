@@ -503,3 +503,68 @@ def test_self_paced_cannot_be_submitted_to_before_starting(self_paced_session):
     sqs = quiz_engine.get_ordered_questions(session["id"])
     with pytest.raises(session_manager.VotingClosedError):
         session_manager.submit_answer_or_skip(session["id"], sqs[0]["id"], p1["id"], "B")
+
+
+# ---------------------------------------------------------------
+# Excel import -> question set (admin.py's Import tab): imports go
+# directly into a set, and a question matching an existing one
+# (same text + type, case-insensitive) is reused instead of being
+# re-inserted as a duplicate.
+# ---------------------------------------------------------------
+@pytest.fixture()
+def empty_set():
+    qs = db.create_question_set(title="__test_import_set__", description="", category="General")
+    yield qs
+    db.delete_question_set(qs["id"])
+
+
+def test_import_creates_new_questions_and_links_them_to_the_set(empty_set):
+    rows = [
+        {
+            "question": "__import_test__ What is EBITDA?", "type": "MCQ",
+            "option_a": "A", "option_b": "B", "option_c": None, "option_d": None,
+            "correct_answer": "A", "explanation": None,
+            "points": 1, "timer_seconds": 30, "category": "Finance", "difficulty": "Easy",
+        },
+    ]
+    try:
+        result = db.import_questions_into_set(rows, empty_set["id"])
+        assert result == {"new_count": 1, "duplicate_count": 0, "total": 1}
+
+        items = db.get_question_set_items(empty_set["id"])
+        assert len(items) == 1
+        assert items[0]["question"] == "__import_test__ What is EBITDA?"
+        assert items[0]["points"] == 1
+    finally:
+        for q in db.list_questions(search="__import_test__"):
+            db.delete_question(q["id"])
+
+
+def test_import_reuses_existing_question_instead_of_duplicating(empty_set):
+    existing = db.create_question(
+        question="__import_test__ Duplicate question", type="MCQ",
+        option_a="A", option_b="B", correct_answer="A", points=1, timer_seconds=30,
+        category="Finance", difficulty="Easy",
+    )
+    try:
+        # Same text (different case) + same type as `existing` -> must
+        # be treated as a duplicate: reused, not re-inserted.
+        rows = [{
+            "question": "__IMPORT_TEST__ Duplicate question", "type": "MCQ",
+            "option_a": "A", "option_b": "B", "option_c": None, "option_d": None,
+            "correct_answer": "A", "explanation": None,
+            "points": 1, "timer_seconds": 30, "category": "Finance", "difficulty": "Easy",
+        }]
+        result = db.import_questions_into_set(rows, empty_set["id"])
+        assert result == {"new_count": 0, "duplicate_count": 1, "total": 1}
+
+        items = db.get_question_set_items(empty_set["id"])
+        assert len(items) == 1
+        assert items[0]["id"] == existing["id"]  # reused, not a new row
+
+        # Confirms no duplicate row was created in the bank.
+        matches = db.list_questions(search="__import_test__")
+        assert len(matches) == 1
+    finally:
+        for q in db.list_questions(search="__import_test__"):
+            db.delete_question(q["id"])

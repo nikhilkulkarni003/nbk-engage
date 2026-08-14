@@ -15,10 +15,12 @@ from utils.validation import validate_question_dict
 
 REQUIRED_COLUMNS = [
     "question", "type", "option_a", "option_b", "option_c", "option_d",
-    "correct_answer", "explanation", "points", "timer_seconds",
+    "correct_answer", "explanation", "timer_seconds",
     "category", "difficulty",
 ]
 
+# No "points" column -- every imported question is worth exactly 1
+# point (the app's default scoring), not user-editable via import.
 SAMPLE_ROWS = [
     {
         "question": "What does EBITDA stand for?",
@@ -29,7 +31,6 @@ SAMPLE_ROWS = [
         "option_d": "Estimated Business Income Tax and Duty Allowance",
         "correct_answer": "A",
         "explanation": "EBITDA is a proxy for operating cash profitability, excluding financing and non-cash items.",
-        "points": 1000,
         "timer_seconds": 30,
         "category": "Finance",
         "difficulty": "Easy",
@@ -43,7 +44,6 @@ SAMPLE_ROWS = [
         "option_d": "FinTech Trends",
         "correct_answer": "",
         "explanation": "",
-        "points": 0,
         "timer_seconds": 20,
         "category": "General",
         "difficulty": "Easy",
@@ -101,7 +101,7 @@ def parse_and_validate(file_bytes: bytes) -> tuple[list[dict], list[str]]:
             "option_d": _clean_str(row.get("option_d")),
             "correct_answer": _clean_str(row.get("correct_answer")),
             "explanation": _clean_str(row.get("explanation")),
-            "points": int(row["points"]) if row.get("points") not in (None, "") else 1000,
+            "points": 1,  # fixed -- not an importable/editable column, see REQUIRED_COLUMNS
             "timer_seconds": int(row["timer_seconds"]) if row.get("timer_seconds") not in (None, "") else 30,
             "category": _clean_str(row.get("category")) or "General",
             "difficulty": (_clean_str(row.get("difficulty")) or "Medium").title(),

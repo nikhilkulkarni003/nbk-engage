@@ -30,14 +30,14 @@ GOOD_ROW = {
     "option_a": "Earnings before interest, tax, depreciation, amortization",
     "option_b": "Net profit", "option_c": "Gross revenue", "option_d": "Total assets",
     "correct_answer": "A", "explanation": "It's a profitability proxy.",
-    "points": 1000, "timer_seconds": 30, "category": "Finance", "difficulty": "Easy",
+    "timer_seconds": 30, "category": "Finance", "difficulty": "Easy",
 }
 
 BAD_ROW = {
     "question": "", "type": "MCQ",  # missing question text
     "option_a": "A", "option_b": "", "option_c": "", "option_d": "",
     "correct_answer": "Z", "explanation": "",
-    "points": 1000, "timer_seconds": 30, "category": "Finance", "difficulty": "Easy",
+    "timer_seconds": 30, "category": "Finance", "difficulty": "Easy",
 }
 
 
@@ -89,3 +89,15 @@ def test_valid_row_normalizes_correct_answer_case():
     valid_rows, errors = parse_and_validate(data)
     assert errors == []
     assert valid_rows[0]["correct_answer"] == "A"
+
+
+def test_points_is_not_an_importable_column():
+    # "points" is deliberately absent from REQUIRED_COLUMNS/the
+    # template -- every imported question is fixed at 1 point,
+    # regardless of what a user might put in an extra "points" column
+    # in their own spreadsheet (which is just ignored, not read).
+    assert "points" not in REQUIRED_COLUMNS
+    data = _build_excel_bytes([GOOD_ROW, GOOD_ROW])
+    valid_rows, errors = parse_and_validate(data)
+    assert errors == []
+    assert all(r["points"] == 1 for r in valid_rows)

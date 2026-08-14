@@ -5,10 +5,11 @@ Participant experience: join -> wait -> question -> answer -> result
 No login. Identity for a browser tab is just (participant_id,
 session_id) held in st.session_state -- purely local UI state that
 tells this tab *which* database rows to read. The actual session
-state, question, timer and results always come fresh from the
-database, so a page refresh never loses shared state (only the "which
-session am I in" pointer, which is why we re-validate everything
-against the DB below).
+state, question and results always come fresh from the database, so a
+page refresh never loses shared state (only the "which session am I
+in" pointer, which is why we re-validate everything against the DB
+below). Host-paced sessions have no timer -- voting stays open until
+the host explicitly closes it.
 
 Rendering is deliberately split two ways so the auto-refresh needed
 for live polling doesn't grey out the question/answer UI while a
@@ -18,8 +19,6 @@ participant is reading or about to tap an option:
     full st.rerun() when it has.
   - _render_session_body: a plain function (not a fragment) that does
     the actual rendering, invoked on load and on real transitions only.
-  - _render_timer_only: the one exception -- an isolated fragment just
-    for the countdown number/progress bar, so it still visibly ticks.
 """
 
 from __future__ import annotations
@@ -30,12 +29,9 @@ import time
 import streamlit as st
 
 from components import progress as progress_component
-from components import question_card, timer as timer_component
-from components.leaderboard import render_leaderboard as render_lb
-from components.results import render_rating_summary, render_results_bars
+from components import question_card
 from components.review import render_full_review
-from components.session_report import render_session_report
-from services import analytics, database as db, diagnostics, quiz_engine, session_manager
+from services import database as db, diagnostics, quiz_engine, session_manager
 
 POLL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "2"))
 
@@ -275,33 +271,19 @@ def _render_waiting(session: dict) -> None:
     st.caption(f"{count} participant(s) have joined so far.")
 
 
-@st.fragment(run_every=POLL_SECONDS)
-def _render_timer_only(started_at, timer_seconds) -> None:
-    """The countdown/progress-bar is isolated in its own tiny
-    auto-refreshing fragment so it keeps visibly ticking down, while
-    the question text and answer buttons in _render_question_active
-    (below) are NOT inside any fragment and are therefore never
-    greyed out by this refresh -- only this small bar redraws every
-    tick, not the tappable options around it."""
-    timer_component.render_timer(started_at, timer_seconds)
-
-
 def _render_question_active(session: dict, sq: dict, participant: dict) -> None:
+    # Host-paced sessions have no timer -- voting stays open until the
+    # host explicitly closes it (see pages/host.py::_render_question_active),
+    # so this only needs to check whether this participant has already
+    # answered, not any time-based cutoff.
     existing = db.get_response(sq["id"], participant["id"])
     diagnostics.mark("get_response_done")
 
     question_card.render_question_prompt(sq)
     diagnostics.mark("question_rendering_done")
-    _render_timer_only(sq.get("started_at"), sq.get("timer_seconds"))
-    remaining = timer_component.seconds_remaining(sq.get("started_at"), sq.get("timer_seconds"))
-    diagnostics.mark("timer_rendering_done")
 
     if existing:
         st.success("✅ Answer submitted! Waiting for the host...")
-        return
-
-    if remaining == 0:
-        st.warning("⏰ Time's up! Waiting for the host to close voting.")
         return
 
     answer = None
@@ -431,11 +413,16 @@ def _render_voting_closed(sq: dict, participant: dict) -> None:
     if existing:
         st.success(f"You answered: **{existing['answer_text']}**")
     else:
-        st.info("You didn't answer in time.")
+        st.info("You didn't answer before voting closed.")
     st.info("⏳ Waiting for the host to reveal results...")
 
 
 def _render_results(sq: dict, participant: dict) -> None:
+    """Per-question reveal: this participant's OWN answer/correctness
+    only -- no group-level option breakdown (bar/pie chart) or rating
+    distribution. That aggregate view is host/trainer-only, on the
+    control room screen, per the same "individual results only" rule
+    as the final summary (see _render_personal_summary)."""
     question_card.render_question_prompt(sq)
     existing = db.get_response(sq["id"], participant["id"])
 
@@ -444,21 +431,26 @@ def _render_results(sq: dict, participant: dict) -> None:
             if existing["is_correct"]:
                 st.success(f"🎉 Correct! You earned **{existing['points_awarded']}** points.")
             else:
-                st.error("Not quite.")
+                st.error(f"Not quite. You answered **{existing['answer_text']}**.")
         else:
-            st.info("You didn't answer in time.")
+            st.info("You didn't answer before voting closed.")
         correct = sq.get("correct_answer")
         if correct:
             st.markdown(f"✅ **Correct answer: {correct}**")
         if sq.get("explanation"):
             st.info(sq["explanation"])
-        render_results_bars(analytics.get_option_results(sq), reveal_correct=True)
     elif sq["type"] == "POLL":
-        render_results_bars(analytics.get_option_results(sq), reveal_correct=False)
+        if existing:
+            st.success(f"You answered: **{existing['answer_text']}**")
+        else:
+            st.info("You didn't answer before voting closed.")
     elif sq["type"] == "RATING":
-        render_rating_summary(analytics.get_rating_summary(sq["id"]))
+        if existing:
+            st.success(f"You rated: **{existing['answer_text']} / 5**")
+        else:
+            st.info("You didn't answer before voting closed.")
     else:
-        st.success("🙌 Thanks! Your response has been added to the group results on the main screen.")
+        st.success("🙌 Thanks! Your response has been recorded.")
 
     st.info("⏳ Waiting for the host...")
 
@@ -475,6 +467,38 @@ def _final_results_revealed(session: dict) -> bool:
     return bool(session.get("group_summary_revealed_at"))
 
 
+def _render_personal_summary(session: dict, participant: dict) -> None:
+    """The final screen a participant sees: THEIR OWN correct/incorrect
+    count and accuracy percentage only. Group-level results (charts,
+    everyone's names/scores, the ranked leaderboard) are host/trainer-
+    only -- visible on the host's Group Results control-room screen,
+    never here. Still gated behind the same reveal flag as before."""
+    if not _final_results_revealed(session):
+        st.info("⏳ Waiting for the host to share the results...")
+        return
+
+    my_responses = db.list_responses_for_participant(session["id"], participant["id"])
+    scored = [r for r in my_responses if r["is_correct"] is not None]
+    correct = sum(1 for r in scored if r["is_correct"])
+    incorrect = len(scored) - correct
+    accuracy_pct = round(correct / len(scored) * 100, 1) if scored else 0.0
+    total_score = sum(r["points_awarded"] for r in my_responses)
+
+    st.markdown("#### 🎯 Your Results")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("✅ Correct", correct)
+    with c2:
+        st.metric("❌ Incorrect", incorrect)
+    with c3:
+        st.metric("Accuracy", f"{accuracy_pct}%")
+    with c4:
+        st.metric("⭐ Your Score", total_score)
+
+    with st.expander("📋 Your Answers", expanded=False):
+        render_full_review(session["id"], participant_id=participant["id"])
+
+
 def _render_leaderboard(session: dict, participant: dict) -> None:
     # SELF_PACED sessions never set current_question_index, so the
     # generic index-based has-next check doesn't apply here -- see the
@@ -485,56 +509,19 @@ def _render_leaderboard(session: dict, participant: dict) -> None:
     )
 
     if not has_next:
-        # Both pacing modes converge here -- the final screen. Nothing
-        # below (group results OR the ranked leaderboard) renders
-        # until the host has revealed; _render_group_results_for_participant
-        # already shows the "waiting" message in that case, so return
-        # right after it instead of falling through to an ungated
-        # leaderboard render.
-        _render_group_results_for_participant(session, participant)
-        if not _final_results_revealed(session):
-            return
-        st.divider()
-
-    rows = analytics.get_leaderboard(session["id"])
-    my_row = next((r for r in rows if r["participant_id"] == participant["id"]), None)
-    if my_row:
-        st.markdown(
-            f"### Your rank: #{my_row['rank']} · {my_row['total_score']:,} pts"
-        )
-    st.markdown("#### 🏆 Leaderboard")
-    render_lb(rows[:10], previous_ranks_key=f"p_lb_prev_{session['id']}",
-              anonymize=session.get("anonymous_leaderboard", False))
-    if has_next:
-        st.info("⏳ Waiting for the host to continue...")
-
-
-def _render_group_results_for_participant(session: dict, participant: dict) -> None:
-    if not session.get("group_summary_revealed_at"):
-        st.info("⏳ Waiting for the host to share the results...")
+        # Both pacing modes converge here -- the final screen.
+        _render_personal_summary(session, participant)
         return
-    render_session_report(session["id"], chart_type="bar", show_sort=False)
-    with st.expander("📋 Your Answers", expanded=False):
-        render_full_review(session["id"], participant_id=participant["id"])
+
+    # Mid-session (INSTANT host-paced only, between questions): no
+    # group leaderboard here either -- participants only ever see
+    # their own results, never everyone else's names/scores/ranks.
+    st.info("⏳ Waiting for the host to continue...")
 
 
 def _render_session_ended(session: dict, participant: dict) -> None:
     st.markdown("## 🏁 Session Ended")
-
-    _render_group_results_for_participant(session, participant)
-    if not _final_results_revealed(session):
-        # The host can click "End Session" without ever clicking
-        # "Reveal to Participants" first -- same gate as
-        # _render_leaderboard, so nothing leaks here either.
-        return
-    st.balloons()
-    st.divider()
-
-    rows = analytics.get_leaderboard(session["id"])
-    my_row = next((r for r in rows if r["participant_id"] == participant["id"]), None)
-    if my_row:
-        st.markdown(f"### Your final rank: #{my_row['rank']} · {my_row['total_score']:,} pts")
-    st.markdown("#### Final Leaderboard")
-    render_lb(rows[:10], previous_ranks_key=f"p_lb_final_{session['id']}",
-              anonymize=session.get("anonymous_leaderboard", False))
+    _render_personal_summary(session, participant)
+    if _final_results_revealed(session):
+        st.balloons()
     st.markdown("Thanks for participating! 🎉")

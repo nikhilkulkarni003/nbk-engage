@@ -21,7 +21,6 @@ from components import progress as progress_component
 from components import question_card
 from components import results as results_component
 from components import session_report as session_report_component
-from components import timer as timer_component
 from services import analytics, database as db, diagnostics, quiz_engine, session_manager
 from utils import auth, qr_code
 from utils.excel_export import build_session_results_workbook
@@ -111,7 +110,7 @@ def _render_create_session_form() -> None:
         pacing_choice = st.radio(
             "Pacing", label_visibility="collapsed",
             options=[
-                "Host-paced (one question at a time, with a timer)",
+                "Host-paced (one question at a time, you control when to advance)",
                 "Self-paced (everyone answers independently, with Skip, no timer)",
             ],
         )
@@ -230,10 +229,9 @@ def _render_control_room(session_id: str) -> None:
                 cq = state["current_question"]
                 self_paced_progress = None
         elif session["reveal_mode"] == "DEFERRED" and session["status"] in ("QUESTION_ACTIVE", "VOTING_CLOSED"):
-            # All-at-once mode is fully hands-off: voting closes and the
-            # session advances to the next question automatically (timer
-            # expiry or everyone-answered) all the way up to the last
-            # question's results -- no host click needed until the final
+            # All-at-once mode is hands-off once everyone has answered
+            # (no timer involved anymore -- host-paced sessions have no
+            # timer at all) -- no host click needed until the final
             # "Reveal to Participants". Pass this tick's already-fetched
             # state in so auto_advance_deferred doesn't re-query it, and
             # only re-fetch full state if a transition actually happened.
@@ -250,18 +248,8 @@ def _render_control_room(session_id: str) -> None:
                 diagnostics.mark("get_full_state_refetch_done")
             session = state["session"]
             cq = state["current_question"]
-        elif session["status"] == "QUESTION_ACTIVE":
-            # Pass in what this tick already fetched instead of
-            # re-querying it inside force_close_voting_if_timer_expired,
-            # and use its return value directly instead of unconditionally
-            # re-reading the session "just in case" afterwards -- when
-            # nothing closed, the already-fetched `session` is still correct.
-            updated = session_manager.force_close_voting_if_timer_expired(
-                session_id, session=state["session"], sq=state["current_question"]
-            )
-            diagnostics.mark(f"force_close_voting_if_timer_expired_done(closed={updated is not None})")
-            if updated is not None:
-                session = updated
+        # INSTANT mode: no timer, no auto-close -- the host closes voting
+        # via the CLOSE VOTING button in _render_question_active only.
 
         _render_header(session, state)
         diagnostics.mark("header_and_qr_render_done")
@@ -406,14 +394,13 @@ def _render_self_paced_active(session: dict, state: dict, progress: list[dict] |
 def _render_question_active(session: dict, sq: dict) -> None:
     question_card.render_question_prompt(sq)
     question_card.render_host_options_preview(sq)
-    timer_component.render_timer(sq.get("started_at"), sq.get("timer_seconds"))
     st.caption("Participants are answering. Live results stay hidden until you close voting.")
     if session["reveal_mode"] == "INSTANT":
         if st.button("⏹️  CLOSE VOTING", type="primary", use_container_width=True):
             session_manager.close_voting(session["id"])
             st.rerun()
     else:
-        st.caption("All-at-once mode: voting closes automatically (timer or everyone answered).")
+        st.caption("All-at-once mode: voting closes automatically once everyone has answered.")
 
 
 def _render_voting_closed(session: dict, sq: dict) -> None:

@@ -335,42 +335,13 @@ def auto_close_self_paced_if_everyone_done(session_id: str, session: dict | None
     return None
 
 
-def force_close_voting_if_timer_expired(session_id: str, session: dict | None = None,
-                                         sq: dict | None = None) -> dict | None:
-    """Called by the host poll loop: if a timer was configured and has
-    elapsed, auto-close voting server-side so latecomers cannot answer
-    after time is up, even if the host's own click lags.
-
-    session/sq let a caller that already fetched this tick's state
-    (via get_full_state) pass it straight in instead of this function
-    re-querying the same two rows again. The caller can then also use
-    this function's return value directly (the updated session when a
-    close happened, otherwise None) instead of unconditionally
-    re-reading the session afterwards "just in case" -- when nothing
-    changed, the caller's own already-fetched session is still correct.
-    """
-    session = session if session is not None else db.get_session(session_id)
-    if session["status"] != "QUESTION_ACTIVE":
-        return None
-    sq = sq if sq is not None else db.get_session_question(session["current_session_question_id"])
-    if not sq or not sq.get("timer_seconds") or not sq.get("started_at"):
-        return None
-    started_at = sq["started_at"]
-    if started_at.tzinfo is None:
-        started_at = started_at.replace(tzinfo=timezone.utc)
-    elapsed = (_now() - started_at).total_seconds()
-    if elapsed >= sq["timer_seconds"]:
-        return close_voting(session_id)
-    return None
-
-
 def auto_advance_deferred(session_id: str, session: dict | None = None,
                            sq: dict | None = None,
                            participant_count: int | None = None,
                            response_count: int | None = None) -> dict | None:
-    """DEFERRED reveal_mode only: fully hands-off question flow. Voting
-    closes automatically once the timer expires OR every joined
-    participant has answered (whichever comes first), and the session
+    """DEFERRED reveal_mode only: fully hands-off question flow. Host-
+    paced sessions have no timer at all -- voting closes automatically
+    once every joined participant has answered, and the session
     immediately moves to the next question with no host click needed.
 
     On the LAST question, it stops one step short of broadcasting to
@@ -405,14 +376,7 @@ def auto_advance_deferred(session_id: str, session: dict | None = None,
         response_count = response_count if response_count is not None else db.count_responses(sq["id"])
         everyone_answered = participant_count > 0 and response_count >= participant_count
 
-        timer_expired = False
-        if sq.get("timer_seconds"):
-            started_at = sq["started_at"]
-            if started_at.tzinfo is None:
-                started_at = started_at.replace(tzinfo=timezone.utc)
-            timer_expired = (_now() - started_at).total_seconds() >= sq["timer_seconds"]
-
-        if not (timer_expired or everyone_answered):
+        if not everyone_answered:
             return None
         session = close_voting(session_id)
 
