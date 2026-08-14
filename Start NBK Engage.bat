@@ -57,7 +57,10 @@ echo Windows Defender Firewall when prompted, or see README.md
 echo section 5 (Network access) for internet-wide access options.
 echo.
 
-start "" /min "%~dp0_open_app_window.bat"
+rem /b runs the helper with no window of its own at all (not even a
+rem minimized one) -- previously /min still briefly showed/flashed a
+rem second console window on the taskbar.
+start "" /b "%~dp0_open_app_window.bat"
 streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --server.headless=true
 
 pause

@@ -26,7 +26,12 @@ load_dotenv()
 
 def _peek_role() -> str:
     """Reads just enough (query params + session_state) to decide page
-    layout before set_page_config runs. Must stay side-effect free."""
+    layout before set_page_config runs. Must stay side-effect free.
+    Mirrors _determine_role's "session_state wins once set" rule below
+    so the pre-layout guess and the real routing decision never
+    disagree about which role is active."""
+    if "nbk_role" in st.session_state:
+        return st.session_state["nbk_role"]
     query_params = st.query_params
     if query_params.get("mode") == "admin":
         return "admin"
@@ -34,7 +39,7 @@ def _peek_role() -> str:
         return "host"
     if "join" in query_params:
         return "participant"
-    return st.session_state.get("nbk_role", "participant")
+    return "participant"
 
 
 _early_role = _peek_role()
@@ -102,18 +107,29 @@ from pages import participant as participant_page  # noqa: E402
 def _determine_role() -> str:
     query_params = st.query_params
 
-    if query_params.get("mode") == "admin":
-        st.session_state["nbk_role"] = "admin"
-    elif query_params.get("mode") == "host":
-        st.session_state["nbk_role"] = "host"
-    elif "join" in query_params:
-        st.session_state["nbk_role"] = "participant"
+    # Only let the URL's ?mode=/?join= set the INITIAL role -- once a
+    # role is already recorded in session_state, it wins on every
+    # subsequent rerun regardless of what's still in the URL.
+    # st.rerun() does NOT change the URL, so without this guard a link
+    # that still contains an old ?mode=host (e.g. the local desktop
+    # launcher opens .../?mode=host) would silently force the role
+    # back to "host" on every single rerun -- making it impossible to
+    # ever switch to "admin" via the in-app button, since this
+    # query-param branch kept re-winning over _switch_role's write.
+    if "nbk_role" not in st.session_state:
+        if query_params.get("mode") == "admin":
+            st.session_state["nbk_role"] = "admin"
+        elif query_params.get("mode") == "host":
+            st.session_state["nbk_role"] = "host"
+        elif "join" in query_params:
+            st.session_state["nbk_role"] = "participant"
 
     return st.session_state.get("nbk_role", "participant")
 
 
 def _switch_role(role: str) -> None:
     st.session_state["nbk_role"] = role
+    st.query_params.clear()
     st.rerun()
 
 

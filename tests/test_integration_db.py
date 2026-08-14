@@ -476,6 +476,27 @@ def test_self_paced_manual_close_and_reveal(self_paced_session):
     assert closed["status"] == "LEADERBOARD"
 
 
+def test_self_paced_reveal_gate_matches_host_paced(self_paced_session):
+    # Same reveal-flag mechanism as DEFERRED mode (see
+    # test_auto_advance_deferred_reaches_leaderboard_after_last_question
+    # and test_reveal_group_summary_to_participants_sets_timestamp) --
+    # closing/reaching LEADERBOARD must NOT set group_summary_revealed_at
+    # by itself; only the host's explicit reveal action does. This is
+    # the single gate pages/participant.py's _render_leaderboard and
+    # _render_session_ended both check (see test_participant_reveal_gate.py
+    # for the participant-side gating logic itself).
+    session, questions = self_paced_session
+    session_manager.start_session_self_paced(session["id"])
+    db.join_session(session["id"], "Alice")
+
+    closed = session_manager.close_and_reveal_self_paced(session["id"])
+    assert closed["status"] == "LEADERBOARD"
+    assert closed["group_summary_revealed_at"] is None  # not revealed yet
+
+    revealed = session_manager.reveal_group_summary_to_participants(session["id"])
+    assert revealed["group_summary_revealed_at"] is not None
+
+
 def test_self_paced_cannot_be_submitted_to_before_starting(self_paced_session):
     session, questions = self_paced_session
     p1 = db.join_session(session["id"], "Alice")

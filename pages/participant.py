@@ -238,6 +238,15 @@ def _render_session_body(session: dict, participant: dict) -> None:
             _render_session_ended(session, participant)
         elif status == "SELF_PACED_ACTIVE":
             _render_self_paced_active(session, participant)
+        elif status == "LEADERBOARD":
+            # Handled at this level, NOT inside the "needs a current
+            # question" branch below -- SELF_PACED sessions never set
+            # current_session_question_id, so nesting this inside that
+            # branch (as it used to be) meant self-paced sessions
+            # reaching LEADERBOARD fell through to "waiting for the
+            # host to start" instead of ever showing the leaderboard/
+            # reveal. _render_leaderboard doesn't need sq at all.
+            _render_leaderboard(session, participant)
         else:
             diagnostics.mark("before_get_current_question")
             sq = db.get_session_question(session["current_session_question_id"]) if session.get(
@@ -252,8 +261,6 @@ def _render_session_body(session: dict, participant: dict) -> None:
                 _render_voting_closed(sq, participant)
             elif status == "RESULTS_REVEALED":
                 _render_results(sq, participant)
-            elif status == "LEADERBOARD":
-                _render_leaderboard(session, participant)
 
         st.markdown("---")
         _render_leave_button()
@@ -456,6 +463,18 @@ def _render_results(sq: dict, participant: dict) -> None:
     st.info("⏳ Waiting for the host...")
 
 
+def _final_results_revealed(session: dict) -> bool:
+    """The single gate both self-paced and host-paced converge on: once
+    there's no next question, NOTHING on this screen -- not the group
+    results/charts, not even the ranked leaderboard/scores -- is shown
+    to a participant until the host explicitly clicks "Reveal to
+    Participants" (sessions.group_summary_revealed_at). Pulled out as
+    its own function so both _render_leaderboard and
+    _render_session_ended check the exact same condition instead of
+    each having their own (previously inconsistent) gating."""
+    return bool(session.get("group_summary_revealed_at"))
+
+
 def _render_leaderboard(session: dict, participant: dict) -> None:
     # SELF_PACED sessions never set current_question_index, so the
     # generic index-based has-next check doesn't apply here -- see the
@@ -466,10 +485,15 @@ def _render_leaderboard(session: dict, participant: dict) -> None:
     )
 
     if not has_next:
-        # Both reveal modes converge here -- the final, anonymous group
-        # results, gated behind the host's explicit "Reveal to
-        # Participants" click.
+        # Both pacing modes converge here -- the final screen. Nothing
+        # below (group results OR the ranked leaderboard) renders
+        # until the host has revealed; _render_group_results_for_participant
+        # already shows the "waiting" message in that case, so return
+        # right after it instead of falling through to an ungated
+        # leaderboard render.
         _render_group_results_for_participant(session, participant)
+        if not _final_results_revealed(session):
+            return
         st.divider()
 
     rows = analytics.get_leaderboard(session["id"])
@@ -495,10 +519,15 @@ def _render_group_results_for_participant(session: dict, participant: dict) -> N
 
 
 def _render_session_ended(session: dict, participant: dict) -> None:
-    st.balloons()
     st.markdown("## 🏁 Session Ended")
 
     _render_group_results_for_participant(session, participant)
+    if not _final_results_revealed(session):
+        # The host can click "End Session" without ever clicking
+        # "Reveal to Participants" first -- same gate as
+        # _render_leaderboard, so nothing leaks here either.
+        return
+    st.balloons()
     st.divider()
 
     rows = analytics.get_leaderboard(session["id"])
